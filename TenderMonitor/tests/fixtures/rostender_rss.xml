@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Как RSS-лента категории РосТендера выглядела 27.09.2026: заголовок записи обрезан
+     многоточием, полное название — в «Предмет тендера», регион — в адресе ссылки. -->
+<rss version="2.0">
+<channel>
+<title>РосТендер – все тендеры России. Тендеры на зачистку резервуаров</title>
+<link>https://rostender.info/</link>
+<description></description>
+<item>
+<title>Комплексная услуга по зачистке и...</title>
+<link>https://rostender.info/region/moskovskaya-oblast/volokolamsk/95246665-tender-kompleksnaya-usluga-po-zachistke-i-graduirovke-rezervuarov-iz-pod-nefteproduktov-s-posleduyushchej-utilizaciej-shlama</link>
+<description>Предмет тендера: Комплексная услуга по зачистке и градуировке резервуаров из-под нефтепродуктов с последующей утилизацией шлама. Согласно ТЗ.;&lt;br /&gt;Место поставки: п.Сычево, Волоколамский Район;&lt;br /&gt;Цена: 0 руб.</description>
+<pubDate>Fri, 25 Sep 2026 10:45:23 +1000</pubDate>
+</item>
+<item>
+<title>Оказание услуг по зачистке ёмкостей...</title>
+<link>https://rostender.info/region/rostovskaya-oblast/rostov-na-donu/95224663-tender-okazanie-uslug-po-zachistke-emkostej-rezervuarov-dlya-hraneniya-gsm-dlya-nujd-glavnogo-upravleniya-mchs-rossii-po</link>
+<description><![CDATA[Предмет тендера: Оказание услуг по зачистке ёмкостей (резервуаров) для хранения ГСМ;<br />Место поставки: г. Ростов-на-Дону;<br />Цена: 248 919 руб.]]></description>
+<pubDate>Fri, 25 Sep 2026 04:12:00 +1000</pubDate>
+</item>
+<item>
+<title>Выполнение работ позачистке и демонтажу...</title>
+<link>https://rostender.info/region/samarskaya-oblast/syzran/95237857-tender-vypolnenie-rabot-pozachistke-i-demontaju-podzemnyh-jelezobetonnyh-rezervuarov-337-338podlejashchih-likvidacii-na-territorii-ao</link>
+<description>Предмет тендера: Выполнение работ позачистке и демонтажу подземных железобетонных резервуаров №337, №338, подлежащих ликвидации; Место поставки: г. Сызрань; Цена: 0 руб.</description>
+<pubDate>Fri, 25 Sep 2026 07:28:39 +1000</pubDate>
+</item>
+<item>
+<title>Водонагреватели; Расширительные баки;...</title>
+<link>https://rostender.info/region/moskva-gorod/87602959-tender-vodonagrevateli-rasshiritelnye-baki-nasosnoe-oborudovanie</link>
+<description>Предмет тендера: Водонагреватели; Расширительные баки; Насосное оборудование; Компенсаторы; Место поставки: г. Москва; Цена: 0 руб.</description>
+<pubDate>Tue, 04 Nov 2025 14:47:02 +1000</pubDate>
+</item>
+</channel>
+</rss>

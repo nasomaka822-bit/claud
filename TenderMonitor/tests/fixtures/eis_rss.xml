@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Устроена как настоящая лента ЕИС: guid нет, номер закупки в regNumber ссылки,
+     описание закодировано дважды и начинается с «Параметров поиска». -->
+<rss version="2.0">
+  <channel>
+    <title>Результаты поиска в реестре заказов и закупок</title>
+    <link>/epz/order/extendedsearch/results.html?searchString=%D0%B7%D0%B0%D1%87%D0%B8%D1%81%D1%82%D0%BA%D0%B0&amp;morphology=on</link>
+    <description>Результаты поиска в реестре заказов и закупок</description>
+    <item>
+      <title>Электронный аукцион №0318100057726000011</title>
+      <link>https://zakupki.gov.ru/epz/order/notice/ea20/view/common-info.html?regNumber=0318100057726000011</link>
+      <description>&lt;b&gt;Параметры поиска: &lt;/b&gt;&lt;br/&gt;&lt;strong&gt;Искомое слово (словосочетание): &lt;/strong&gt;зачистка резервуаров&lt;br/&gt;&lt;strong&gt;Закупки по: &lt;/strong&gt;44-ФЗ&lt;br/&gt;&lt;br&gt;&lt;strong&gt;Найденный результат:&lt;/strong&gt;&lt;br/&gt;&lt;strong&gt;Электронный аукцион&lt;/strong&gt; &lt;a href='https://zakupki.gov.ru/epz/order/notice/ea20/view/common-info.html?regNumber=0318100057726000011' target='_blank' &gt;&lt;strong&gt;№ &lt;/strong&gt;&lt;strong&gt;0318100057726000011&lt;/strong&gt;&lt;/a&gt;&lt;br/&gt;&lt;strong&gt;Наименование объекта закупки: &lt;/strong&gt;Выполнение работ по &lt;span class='highlightColor'&gt;зачистке&lt;/span&gt; технических средств службы горючего&lt;br/&gt;&lt;strong&gt;Размещение выполняется по: &lt;/strong&gt;44-ФЗ&lt;br/&gt;&lt;strong&gt;Наименование Заказчика: &lt;/strong&gt;СЛУЖБА В Г. НОВОРОССИЙСКЕ ПОГРАНИЧНОГО УПРАВЛЕНИЯ ФСБ РОССИИ ПО КРАСНОДАРСКОМУ КРАЮ&lt;br/&gt;&lt;strong&gt;Начальная цена контракта: &lt;/strong&gt;1 450 000,00&lt;strong&gt; Валюта: &lt;/strong&gt;Российский рубль&lt;br/&gt;&lt;strong&gt;Размещено: &lt;/strong&gt;24.09.2026&lt;br/&gt;&lt;strong&gt;Этап размещения: &lt;/strong&gt;Подача заявок&lt;br/&gt;&lt;strong&gt;Идентификационный код закупки (ИКЗ): &lt;/strong&gt;263231500497323150100100110010000000&lt;br/&gt;</description>
+      <pubDate>Thu, 24 Sep 2026 10:15:00 GMT</pubDate>
+    </item>
+    <item>
+      <title>Закупка, осуществляемая в соответствии с частью 12 статьи 93 Закона № 44-ФЗ №0358300012326000044</title>
+      <link>https://zakupki.gov.ru/epz/order/notice/ezt20/view/common-info.html?regNumber=0358300012326000044</link>
+      <description>&lt;b&gt;Параметры поиска: &lt;/b&gt;&lt;br/&gt;&lt;strong&gt;Искомое слово (словосочетание): &lt;/strong&gt;зачистка резервуаров&lt;br/&gt;&lt;br&gt;&lt;strong&gt;Найденный результат:&lt;/strong&gt;&lt;br/&gt;&lt;strong&gt;Закупка, осуществляемая в соответствии с частью 12 статьи 93 Закона № 44-ФЗ&lt;/strong&gt;&lt;br/&gt;&lt;strong&gt;Наименование объекта закупки: &lt;/strong&gt;null&lt;br/&gt;&lt;strong&gt;Наименование Заказчика: &lt;/strong&gt;МУП "ВОДОКАНАЛ" Г. ТАГАНРОГА&lt;br/&gt;&lt;strong&gt;Начальная цена контракта: &lt;/strong&gt;310 000,00&lt;br/&gt;&lt;strong&gt;Размещено: &lt;/strong&gt;25.09.2026&lt;br/&gt;&lt;strong&gt;Идентификационный код закупки (ИКЗ): &lt;/strong&gt;263615400239161540100100520010000244&lt;br/&gt;</description>
+      <pubDate>Fri, 25 Sep 2026 08:00:00 GMT</pubDate>
+    </item>
+    <item>
+      <title>Запрос котировок №32615512345</title>
+      <link>https://zakupki.gov.ru/epz/order/notice/notice223/common-info.html?regNumber=32615512345</link>
+      <description>&lt;b&gt;Параметры поиска: &lt;/b&gt;&lt;br/&gt;&lt;strong&gt;Искомое слово (словосочетание): &lt;/strong&gt;зачистка резервуаров&lt;br/&gt;&lt;br&gt;&lt;strong&gt;Найденный результат:&lt;/strong&gt;&lt;br/&gt;&lt;strong&gt;Наименование объекта закупки: &lt;/strong&gt;Зачистка резервуаров РВС-2000 на нефтебазе&lt;br/&gt;&lt;strong&gt;Наименование Заказчика: &lt;/strong&gt;ООО "СЕВЕРНЕФТЬ"&lt;br/&gt;&lt;strong&gt;Начальная цена договора: &lt;/strong&gt;5 000 000,00&lt;br/&gt;&lt;strong&gt;Размещено: &lt;/strong&gt;23.09.2026&lt;br/&gt;&lt;strong&gt;Идентификационный код закупки (ИКЗ): &lt;/strong&gt;263770100000177010100100010010000244&lt;br/&gt;</description>
+      <pubDate>Wed, 23 Sep 2026 12:00:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>

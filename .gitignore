@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+TenderMonitor/tender_monitor.db
+TenderMonitor/tender_monitor.log
+TenderMonitor/probe_report.txt
+TenderMonitor/cron.log
+TenderMonitor/*.crt
