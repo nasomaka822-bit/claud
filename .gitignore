@@ -11,3 +11,6 @@ TenderMonitor/issuer_certs/
 TenderMonitor/probe_pages/
 TenderMonitor/.venv/
 TenderMonitor/backups/
+TenderMonitor/tender_monitor.broken-*
+TenderMonitor/requirements.rollback.txt
+TenderMonitor/tender_monitor.db-*

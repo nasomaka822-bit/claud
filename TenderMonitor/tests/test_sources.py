@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -41,8 +43,13 @@ STRICT = dict(SETTINGS, max_age_days=0)                        # регион у
 LOOSE = dict(SETTINGS, max_age_days=0, only_my_regions=False)  # только слова
 
 
+ORIGINAL_DOWNLOAD = tm.download_mincifry_certs
 ISSUERS_TMP = tempfile.TemporaryDirectory()
-tm.ISSUERS_DIR = Path(ISSUERS_TMP.name) / "issuer_certs"  # тесты не трогают папку со скриптом
+# тесты не трогают папку со скриптом и не ходят в интернет
+tm.ISSUERS_DIR = Path(ISSUERS_TMP.name) / "issuer_certs"
+tm.PROBE_PAGES_DIR = Path(ISSUERS_TMP.name) / "probe_pages"
+tm.BACKUP_DIR = Path(ISSUERS_TMP.name) / "backups"
+tm.download_mincifry_certs = lambda cfg: (0, ["в тестах сертификаты не скачиваются"])
 
 
 @contextlib.contextmanager
@@ -1029,6 +1036,176 @@ class LongRun(unittest.TestCase):
         self.assertIn(today, files)
         copy = tm.Store(tm.BACKUP_DIR / today)
         self.assertEqual(copy.kv_get("x"), 1)
+
+
+class Autonomy(unittest.TestCase):
+    """Самообслуживание: сертификаты, чистка, обновления с откатом, восстановление базы, сторож."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        for name, value in (("BASE_DIR", self.dir), ("DB_PATH", self.dir / "t.db"),
+                            ("BUNDLE_PATH", self.dir / "bundle.pem"), ("BACKUP_DIR", self.dir / "backups"),
+                            ("ISSUERS_DIR", self.dir / "issuer_certs"), ("PROBE_PAGES_DIR", self.dir / "probe_pages"),
+                            ("LOG_PATH", self.dir / "t.log")):
+            self.enterContext(patched(tm, name, value))
+        self.russian = (FIX / "certs" / "russian_trusted_test.der").read_bytes()
+        self.cfg = dict(CFG, certs={"ca_files": ["root.crt"], "download_urls": ["https://gu-st.ru/root.crt"]})
+
+    def fake_session(self, body: bytes):
+        test = self
+
+        class Session:
+            headers: dict = {}
+            proxies: dict = {}
+
+            def get(self, url, **kw):
+                import requests
+                resp = requests.Response()
+                resp.status_code, resp._content = 200, body
+                test.downloaded = url
+                return resp
+        return Session
+
+    def download(self, body: bytes):
+        """Настоящее скачивание (в остальных тестах оно подменено) с поддельным ответом сервера."""
+        with patched(tm.requests, "Session", self.fake_session(body)):
+            return ORIGINAL_DOWNLOAD(self.cfg)
+
+    def test_download_accepts_only_russian_trusted(self):
+        saved, errors = self.download(self.russian)
+        self.assertEqual(saved, 1)
+        self.assertEqual(tm.cert_cn(tm.cert_der((self.dir / "root.crt").read_bytes())), "Russian Trusted Test Root CA")
+        (self.dir / "root.crt").unlink()
+        saved, errors = self.download((FIX / "certs" / "root.der").read_bytes())
+        self.assertEqual(saved, 0)
+        self.assertIn("неожиданный сертификат «Test Root CA»", errors[0])
+        self.assertFalse((self.dir / "root.crt").exists())
+        saved, errors = self.download("<html>Сайт на обслуживании</html>".encode())
+        self.assertEqual(saved, 0)
+
+    def test_eis_certificate_renewed_on_error(self):
+        import requests
+        http = tm.Http(self.cfg)
+        calls = []
+
+        def get(url, **kw):
+            calls.append(url)
+            if len(calls) == 1:
+                raise requests.exceptions.SSLError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+                                                   "unable to get local issuer certificate")
+            return FakeResponse(url, b"<rss></rss>", "application/rss+xml")
+
+        http.session.get = get
+
+        def renewed(cfg):
+            (self.dir / "root.crt").write_text(tm.ssl.DER_cert_to_PEM_cert(self.russian), encoding="ascii")
+            return 1, []
+
+        with patched(tm, "download_mincifry_certs", renewed), patched(tm.time, "sleep", lambda s: None):
+            http.get("https://zakupki.gov.ru/epz/order/extendedsearch/rss.html")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(http.healed, ["сертификаты Минцифры скачаны заново"])
+        self.assertTrue(http.bundle)
+
+    def test_expired_site_certificate_is_replaced(self):
+        tm.ISSUERS_DIR.mkdir()
+        (tm.ISSUERS_DIR / "aston.ru.crt").write_bytes((FIX / "certs" / "intermediate.der").read_bytes())
+        http = tm.Http(self.cfg)
+        self.assertTrue(http.drop_expired_issuers("aston.ru"))
+        self.assertFalse((tm.ISSUERS_DIR / "aston.ru.crt").exists())
+        self.assertFalse(http.drop_expired_issuers("aston.ru"))
+
+    def test_broken_source_is_checked_less_often(self):
+        store = tm.Store(tm.DB_PATH)
+        src = source({"name": "НМТП", "type": "html", "url": "https://www.nmtp.info/"})
+        store.source_state(src)
+        store.touch(src)
+        for _ in range(3):
+            store.source_fail(src, "адрес не найден")
+        state = store.source_state(src)
+        self.assertFalse(store.due(src, state))  # через час, не раньше
+        later = tm.now_utc() + timedelta(hours=1, minutes=1)
+        with patched(tm, "now_utc", lambda: later):
+            self.assertTrue(store.due(src, state))
+        for _ in range(10):
+            store.source_fail(src, "адрес не найден")
+        state = store.source_state(src)
+        with patched(tm, "now_utc", lambda: later + timedelta(hours=22)):
+            self.assertFalse(store.due(src, state))
+        with patched(tm, "now_utc", lambda: later + timedelta(hours=24)):
+            self.assertTrue(store.due(src, state))  # но не реже раза в сутки
+
+    def test_daily_maintenance(self):
+        store = tm.Store(tm.DB_PATH)
+        tm.PROBE_PAGES_DIR.mkdir()
+        old_page = tm.PROBE_PAGES_DIR / "old.html"
+        old_page.write_text("x")
+        os.utime(old_page, (time.time() - 40 * 86400,) * 2)
+        (tm.PROBE_PAGES_DIR / "new.html").write_text("x")
+        tm.ISSUERS_DIR.mkdir()
+        (tm.ISSUERS_DIR / "aston.ru.bundle.pem").write_text("старый файл")
+        (tm.ISSUERS_DIR / "old.ru.crt").write_bytes((FIX / "certs" / "intermediate.der").read_bytes())
+        called = []
+        with patched(tm, "cert_not_after", lambda der: tm.now_utc() + timedelta(days=3)), \
+                patched(tm, "download_mincifry_certs", lambda cfg: called.append(1) or (2, [])), \
+                patched(tm, "in_venv", lambda: True), \
+                patched(tm, "update_dependencies", lambda: ("библиотеки обновлены: certifi==2027.1.1", True)):
+            notes, restart = tm.maintenance(self.cfg, store, allow_updates=True)
+            self.assertEqual(tm.maintenance(self.cfg, store, allow_updates=True), ([], False))  # раз в сутки
+        self.assertEqual(sorted(p.name for p in tm.PROBE_PAGES_DIR.iterdir()), ["new.html"])
+        self.assertEqual(list(tm.ISSUERS_DIR.iterdir()), [])
+        self.assertEqual(called, [1])  # сертификат Минцифры (нет файла) скачан
+        self.assertIn("сертификаты Минцифры обновлены", notes)
+        self.assertIn("библиотеки обновлены: certifi==2027.1.1", notes)
+        self.assertTrue(restart)
+
+    def test_dependency_update_rolls_back_when_tests_fail(self):
+        commands = []
+        freezes = iter(["requests==2.32.5\n", "requests==2.40.0\n"])
+
+        def run(cmd, **kw):
+            commands.append(cmd[3:5] if len(cmd) > 4 else cmd[3:])
+            out = next(freezes) if cmd[-1] == "freeze" else ""
+            return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+        with patched(tm.subprocess, "run", run), patched(tm, "run_tests", lambda: (False, "FAILED (errors=2)")):
+            note, restart = tm.update_dependencies()
+        self.assertFalse(restart)
+        self.assertIn("не прошло тесты", note)
+        self.assertIn("requests==2.40.0", note)
+        self.assertEqual(commands[-1], ["install", "-q"])  # откат на сохранённые версии
+        self.assertEqual((self.dir / "requirements.rollback.txt").read_text(), "requests==2.32.5\n")
+
+    def test_broken_database_restored_from_backup(self):
+        store = tm.Store(tm.DB_PATH)
+        store.kv_set("x", 42)
+        tm.backup_database(store)
+        store.db.close()
+        tm.DB_PATH.write_bytes(b"SQLite format 3\x00" + b"\xff" * 4000)  # испорченный файл
+        text = tm.ensure_database()
+        self.assertIn("восстановил копию", text)
+        self.assertEqual(tm.Store(tm.DB_PATH).kv_get("x"), 42)
+        self.assertEqual(tm.ensure_database(), "")
+
+    def test_watchdog_and_crash_notice(self):
+        bot = FakeBot()
+        ctl = tm.BotController(bot)
+        ctl.store.kv_set("alive", True)  # прошлый запуск не завершился
+        tm.LOG_PATH.write_text("2026-09-27 10:00:00 ERROR Сбой проверки\n", encoding="utf-8")
+        with patched(tm.TelegramBot, "call", lambda *a, **k: None):
+            ctl.bot.call = lambda *a, **k: None
+            ctl.bot.updates = lambda timeout: []
+            ctl.running.acquire()
+            ctl.check_started = time.monotonic() - tm.CHECK_TIMEOUT - 1
+            with patched(tm, "load_config", lambda: CFG):
+                code = ctl.run(CFG, ["База восстановлена"])
+        self.assertEqual(code, 3)
+        self.assertIn("перезапущен после сбоя", bot.said[0])
+        self.assertIn("ERROR Сбой проверки", bot.said[0])
+        self.assertIn("База восстановлена", bot.said[0])
+        self.assertIn("зависла", bot.said[-1])
 
 
 if __name__ == "__main__":

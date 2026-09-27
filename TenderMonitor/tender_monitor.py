@@ -33,8 +33,10 @@ import logging.handlers
 import os
 import random
 import re
+import shutil
 import signal
 import smtplib
+import subprocess
 import socket
 import sqlite3
 import ssl
@@ -66,7 +68,7 @@ except ModuleNotFoundError:
     print("Не хватает библиотек. Установите их командой:\n    pip install requests beautifulsoup4")
     sys.exit(1)
 
-VERSION = "1.9"
+VERSION = "2.0"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.toml"
 DB_PATH = BASE_DIR / "tender_monitor.db"
@@ -116,6 +118,15 @@ check_times = ["09:00", "17:00"]
 # Режим --bot: после каждой проверки по расписанию присылать короткий итог,
 # даже если новых тендеров нет. false — писать только о тендерах и сбоях.
 report_each_check = true
+
+# Самообслуживание (режим --bot): раз в месяц обновлять библиотеки Python.
+# После обновления прогоняются тесты; если что-то сломалось, прежние версии
+# возвращаются. Работает, когда скрипт установлен через install_pi.sh.
+auto_update = true
+
+# Раз в неделю обновлять сам скрипт из git (git pull), если папка — копия
+# git-репозитория. После обновления прогоняются тесты, при ошибке — откат.
+auto_update_code = false
 
 # true — присылать только тендеры из ваших регионов (списки ниже).
 # Тендеры, у которых регион определить не удалось, приходят всегда.
@@ -1283,7 +1294,10 @@ class Http:
         proxy = str(settings.get("proxy", "")).strip()
         if proxy:
             self.session.proxies.update({"http": proxy, "https": proxy})
+        self.cfg = cfg
         self.bundle = prepare_bundle(cfg)
+        self.renew_tried = False
+        self.healed: list[str] = []  # что исправлено само во время проверки — для сообщения в чат
         self.respect_robots = bool(settings.get("respect_robots", True))
         self.robots: dict[str, Robots | None] = {}
         self.last_hit: dict[str, float] = {}
@@ -1332,6 +1346,40 @@ class Http:
                 self.session.mount(prefix, HostTLSAdapter(context))
             return True  # проверку делает контекст адаптера
         return self.bundle if (self.bundle and is_ru_zone(host)) else True
+
+    def renew_mincifry(self, host: str, error: str) -> bool:
+        """Ошибка сертификата на сайте в зоне .ru: если сертификатов Минцифры нет, они истекли или это ЕИС
+        (она всегда на сертификате Минцифры) — один раз за проверку скачать их заново."""
+        if self.renew_tried:
+            return False
+        names = self.cfg.get("certs", {}).get("ca_files", [])
+        files = [BASE_DIR / str(n) for n in names]
+        missing = not all(f.is_file() for f in files)
+        expired = any(f.is_file() and (cert_not_after(cert_der(f.read_bytes()) or b"") or now_utc())
+                      <= now_utc() + timedelta(days=CERT_WARN_DAYS) for f in files)
+        if not (missing or expired or host.endswith("zakupki.gov.ru") or "expired" in error):
+            return False
+        self.renew_tried = True
+        saved, errors = download_mincifry_certs(self.cfg)
+        if not saved:
+            log.warning("Сертификаты Минцифры не обновились: %s", "; ".join(errors))
+            return False
+        self.bundle = prepare_bundle(self.cfg)
+        self.host_contexts.clear()
+        self.healed.append("сертификаты Минцифры скачаны заново")
+        log.info("Сертификаты Минцифры обновлены автоматически")
+        return True
+
+    def drop_expired_issuers(self, host: str) -> bool:
+        """Докачанный сертификат сайта истёк: удалить его, чтобы при повторе скачать свежий."""
+        path = _host_file(host, ".crt")
+        if not path.is_file():
+            return False
+        path.unlink()
+        self.host_contexts.pop(host, None)
+        self.issuer_tried.discard(host)
+        self.healed.append(f"истёкший сертификат сайта {host} заменён")
+        return True
 
     def fetch_missing_issuer(self, url: str) -> bool:
         """Достраивает цепочку сертификатов сайта. True — добавлено новое, запрос стоит повторить.
@@ -1575,6 +1623,10 @@ class Http:
             except requests.exceptions.SSLError as exc:
                 low = str(exc).lower()
                 if "certificate verify failed" in low:
+                    if is_ru_zone(host) and self.renew_mincifry(host, low):
+                        continue  # сертификаты Минцифры обновлены — повторяем
+                    if "expired" in low and self.drop_expired_issuers(host):
+                        continue  # докачанный сертификат сайта истёк — скачаем свежий
                     if "hostname mismatch" in low or "doesn't match" in low or "not valid for" in low:
                         raise FetchError(
                             "сертификат сайта выписан на другой адрес: сайт переехал или настроен с ошибкой"
@@ -2332,12 +2384,20 @@ class Store:
         self.db.commit()
 
     def due(self, src: Source, state: sqlite3.Row) -> bool:
-        """Пора ли проверять источник с настройкой every_minutes."""
-        if not src.every_minutes or not state["bootstrapped"] or not state["last_check"]:
+        """Пора ли проверять источник: с настройкой every_minutes — не чаще, чем задано; сломанный
+        (3 ошибки подряд и больше) — всё реже: через 1, 2, 4… часа, но не реже раза в сутки."""
+        if not state["last_check"]:
             return True
         try:
             last = datetime.fromisoformat(state["last_check"])
         except ValueError:
+            return True
+        fails = state["fail_count"] or 0
+        if fails >= FAIL_ALERT_AFTER:
+            pause = timedelta(hours=min(24, 2 ** (fails - FAIL_ALERT_AFTER)))
+            if now_utc() - last < pause - timedelta(minutes=2):
+                return False
+        if not src.every_minutes or not state["bootstrapped"]:
             return True
         # запас 2 минуты: проверки в цикле идут с небольшим разбросом по времени
         return now_utc() - last >= timedelta(minutes=src.every_minutes) - timedelta(minutes=2)
@@ -2537,6 +2597,190 @@ def backup_database(store: Store) -> None:
             old.unlink()
     except (OSError, sqlite3.Error) as exc:
         log.warning("Не удалось сохранить копию базы: %s", short_err(exc))
+
+
+# ---------------------------------------------------------------------------
+# Самообслуживание: чистка, сертификаты, обновления, восстановление базы
+# ---------------------------------------------------------------------------
+
+LOW_DISK_MB = 300
+
+
+def in_venv() -> bool:
+    return sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+
+
+def run_tests() -> tuple[bool, str]:
+    """Тесты из папки tests: после обновления библиотек или кода проверяем, что всё работает."""
+    if not (BASE_DIR / "tests").is_dir():
+        return True, "тестов нет"
+    try:
+        proc = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-q"],
+                              cwd=BASE_DIR, capture_output=True, text=True, timeout=900)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, short_err(exc)
+    tail = (proc.stderr or proc.stdout).strip().splitlines()[-1:] or [""]
+    return proc.returncode == 0, tail[0]
+
+
+def update_dependencies() -> tuple[str, bool]:
+    """pip install -U с проверкой тестами и откатом. Возвращает (что произошло, нужен ли перезапуск)."""
+    pip = [sys.executable, "-m", "pip"]
+    try:
+        before = subprocess.run(pip + ["freeze"], capture_output=True, text=True, timeout=120, check=True).stdout
+        subprocess.run(pip + ["install", "-q", "-U", "-r", str(BASE_DIR / "requirements.txt")],
+                       capture_output=True, text=True, timeout=900, check=True)
+        after = subprocess.run(pip + ["freeze"], capture_output=True, text=True, timeout=120, check=True).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"библиотеки не обновились: {short_err(exc)}", False
+    if before == after:
+        return "", False
+    ok, detail = run_tests()
+    changed = sorted(set(after.splitlines()) - set(before.splitlines()))
+    if ok:
+        return "библиотеки обновлены: " + ", ".join(changed), True
+    backup = BASE_DIR / "requirements.rollback.txt"
+    backup.write_text(before, encoding="utf-8")
+    subprocess.run(pip + ["install", "-q", "-r", str(backup)], capture_output=True, timeout=900)
+    return f"обновление библиотек ({', '.join(changed)}) не прошло тесты ({detail}), вернул прежние версии", False
+
+
+def update_code() -> tuple[str, bool]:
+    """git pull для папки-репозитория, с проверкой тестами и откатом."""
+    root = next((d for d in (BASE_DIR, BASE_DIR.parent) if (d / ".git").exists()), None)
+    if root is None or shutil.which("git") is None:
+        return "", False
+    git = ["git", "-C", str(root)]
+    try:
+        old = subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+        subprocess.run(git + ["pull", "--ff-only", "-q"], capture_output=True, text=True, timeout=300, check=True)
+        new = subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"скрипт не обновился из git: {short_err(exc)}", False
+    if old == new:
+        return "", False
+    ok, detail = run_tests()
+    if ok:
+        return f"скрипт обновлён из git ({old[:7]} → {new[:7]})", True
+    subprocess.run(git + ["reset", "--hard", "-q", old], capture_output=True)
+    return f"новая версия скрипта не прошла тесты ({detail}), остаюсь на прежней", False
+
+
+def cleanup(aggressive: bool = False) -> list[str]:
+    """Удаляет то, что копится само: старые страницы --probe, файлы прошлых версий, лишние копии базы."""
+    removed = 0
+    week = time.time() - (0 if aggressive else 30 * 86400)
+    if PROBE_PAGES_DIR.is_dir():
+        for f in PROBE_PAGES_DIR.glob("*.html"):
+            if f.stat().st_mtime < week:
+                f.unlink(missing_ok=True)
+                removed += 1
+    if ISSUERS_DIR.is_dir():
+        for f in ISSUERS_DIR.glob("*.bundle.pem"):  # от версий 1.2–1.5
+            f.unlink(missing_ok=True)
+            removed += 1
+    if aggressive and BACKUP_DIR.is_dir():
+        for f in sorted(BACKUP_DIR.glob("tender_monitor-*.db"))[:-2]:
+            f.unlink(missing_ok=True)
+            removed += 1
+    for f in (BASE_DIR / "requirements.rollback.txt",):
+        f.unlink(missing_ok=True)
+    return [f"удалено старых файлов: {removed}"] if removed and aggressive else []
+
+
+def maintenance(cfg: dict, store: Store, *, allow_updates: bool) -> tuple[list[str], bool]:
+    """Ежедневное обслуживание. Возвращает (сообщения для чата, нужен ли перезапуск)."""
+    notes: list[str] = []
+    restart = False
+    today = now_utc().astimezone(MSK).date().isoformat()
+    if store.kv_get("maintenance_day") == today:
+        return notes, restart
+    store.kv_set("maintenance_day", today)
+    settings = cfg.get("settings", {})
+
+    # место на диске
+    try:
+        free_mb = shutil.disk_usage(BASE_DIR).free // (1024 * 1024)
+    except OSError:
+        free_mb = LOW_DISK_MB + 1
+    notes += cleanup(aggressive=free_mb < LOW_DISK_MB)
+    if free_mb < LOW_DISK_MB:
+        notes.append(f"на диске осталось {free_mb} МБ, почистил старые файлы")
+
+    # сертификаты Минцифры: скачать заново, если их нет или они скоро закончатся
+    files = [BASE_DIR / str(n) for n in cfg.get("certs", {}).get("ca_files", [])]
+    soon = now_utc() + timedelta(days=CERT_WARN_DAYS)
+    if files and (not all(f.is_file() for f in files) or any(
+            f.is_file() and (cert_not_after(cert_der(f.read_bytes()) or b"") or soon) <= soon for f in files)):
+        saved, errors = download_mincifry_certs(cfg)
+        if saved:
+            notes.append("сертификаты Минцифры обновлены")
+        else:
+            log.warning("Сертификаты Минцифры не обновились: %s", "; ".join(errors))
+            notes.append("не удалось скачать сертификаты Минцифры, без них ЕИС не откроется; попробую завтра "
+                         "снова (вручную: python tender_monitor.py --setup-cert)")
+
+    # докачанные сертификаты сайтов, которые скоро закончатся: удалить, при первом запросе скачаются новые
+    if ISSUERS_DIR.is_dir():
+        for f in ISSUERS_DIR.glob("*.crt"):
+            end = cert_not_after(cert_der(f.read_bytes()) or b"")
+            if end and end <= now_utc() + timedelta(days=7):
+                f.unlink(missing_ok=True)
+                notes.append(f"удалён истекающий сертификат {f.name}, скачаю новый при следующем запросе")
+
+    # база: раз в месяц сжать
+    month = today[:7]
+    if store.kv_get("vacuum_month") != month:
+        store.kv_set("vacuum_month", month)
+        try:
+            store.db.execute("VACUUM")
+        except sqlite3.Error as exc:
+            log.warning("VACUUM: %s", short_err(exc))
+
+    # обновления: библиотеки раз в месяц, код раз в неделю
+    if allow_updates and settings.get("auto_update", True) and in_venv() \
+            and store.kv_get("deps_month") != month:
+        store.kv_set("deps_month", month)
+        note, need = update_dependencies()
+        notes += [note] if note else []
+        restart = restart or need
+    week_no = now_utc().strftime("%G-%V")
+    if allow_updates and settings.get("auto_update_code", False) and store.kv_get("code_week") != week_no:
+        store.kv_set("code_week", week_no)
+        note, need = update_code()
+        notes += [note] if note else []
+        restart = restart or need
+    return notes, restart
+
+
+def ensure_database() -> str:
+    """Проверка базы при запуске. Если файл испорчен (сбой питания, карта памяти), восстановить
+    последнюю копию из backups. Возвращает текст для чата или пустую строку."""
+    if not DB_PATH.exists():
+        return ""
+    try:
+        db = sqlite3.connect(str(DB_PATH), timeout=30)
+        result = db.execute("PRAGMA quick_check").fetchone()[0]
+        db.close()
+        if result == "ok":
+            return ""
+    except sqlite3.Error as exc:
+        result = short_err(exc)
+    broken = DB_PATH.with_name(f"tender_monitor.broken-{now_utc():%Y%m%d%H%M}.db")
+    for suffix in ("", "-wal", "-shm"):
+        part = Path(str(DB_PATH) + suffix)
+        if part.exists():
+            part.replace(Path(str(broken) + suffix))
+    copies = sorted(BACKUP_DIR.glob("tender_monitor-*.db")) if BACKUP_DIR.is_dir() else []
+    if copies:
+        shutil.copyfile(copies[-1], DB_PATH)
+        text = (f"База была повреждена ({result}), восстановил копию {copies[-1].name}. "
+                f"Испорченный файл сохранён как {broken.name}.")
+    else:
+        text = (f"База была повреждена ({result}), копий нет — начинаю с новой. "
+                "Первая проверка пришлёт сводку тендеров, которые сейчас есть в источниках.")
+    log.error(text)
+    return text
 
 
 def item_html(item: Item, label: str) -> str:
@@ -2818,8 +3062,9 @@ def run_once(cfg: dict, *, dry_run: bool = False, report: dict | None = None) ->
             log.debug("… %s: проверяется раз в %d мин, сейчас пропускаю", src.name, src.every_minutes)
             continue
         store.touch(src)
+        info: dict = {}
         try:
-            items = collect(src, http)
+            items = collect(src, http, info)
         except Exception as exc:  # источник не должен ронять всю проверку
             error = short_err(exc) if isinstance(exc, FetchError) else f"{exc.__class__.__name__}: {short_err(exc)}"
             fails = store.source_fail(src, error)
@@ -2827,7 +3072,11 @@ def run_once(cfg: dict, *, dry_run: bool = False, report: dict | None = None) ->
             failed_names.append(src.name)
             log.warning("× %s: %s", src.name, error)
             if state["last_ok"] and fails >= FAIL_ALERT_AFTER and not state["alerted"]:
-                alerts.append(f"Источник «{src.name}» не работает {fails} проверки подряд: {error}")
+                saved = save_probe_page(src, info["html"]) if info.get("html") else ""
+                alerts.append(f"Источник «{src.name}» не работает {fails} проверки подряд: {error}. "
+                              "Буду проверять его реже, пока не заработает"
+                              + (f"; страница сохранена в {saved} — пришлите её, чтобы поправить разбор" if saved
+                                 else "") + ".")
                 store.set_alerted(src)
             continue
 
@@ -2859,6 +3108,8 @@ def run_once(cfg: dict, *, dry_run: bool = False, report: dict | None = None) ->
                     store.enqueue(item)
         shrank = store.source_shrank(src, len(items)) if not bootstrap else ""
         if shrank:
+            saved = save_probe_page(src, info["html"]) if info.get("html") else ""
+            shrank += f" Страница сохранена в {saved} — пришлите её, чтобы поправить разбор." if saved else ""
             alerts.append(shrank)
             log.warning(shrank)
         store.source_ok(src, len(items))
@@ -2902,6 +3153,8 @@ def run_once(cfg: dict, *, dry_run: bool = False, report: dict | None = None) ->
     if alerts:
         announce(notifiers, "\n".join(alerts))
 
+    if http.healed:
+        alerts.append("Исправлено автоматически: " + "; ".join(dict.fromkeys(http.healed)) + ".")
     alerts_cert = certificate_warnings(cfg, store)
     if alerts_cert:
         announce(notifiers, "\n".join(alerts_cert))
@@ -3071,33 +3324,53 @@ def cmd_get_chat_id(cfg: dict) -> int:
     return 0
 
 
-def cmd_setup_cert(cfg: dict) -> int:
+def download_mincifry_certs(cfg: dict) -> tuple[int, list[str]]:
+    """Скачивает сертификаты Минцифры с официального адреса (HTTPS, проверка по стандартным сертификатам).
+    Файл заменяется, только если скачан действующий сертификат с именем «Russian Trusted …»:
+    так случайная страница-заглушка или подмена не станет доверенным сертификатом."""
     urls = cfg.get("certs", {}).get("download_urls", CERT_URLS)
     names = cfg.get("certs", {}).get("ca_files", [])
     session = requests.Session()
     session.headers["User-Agent"] = USER_AGENT
-    saved = 0
+    proxy = str(cfg.get("settings", {}).get("proxy", "")).strip()
+    if proxy:
+        session.proxies.update({"http": proxy, "https": proxy})
+    saved, errors = 0, []
     for i, url in enumerate(urls):
         name = names[i] if i < len(names) else Path(urlparse(url).path).name
         try:
             resp = session.get(url, timeout=30)
             resp.raise_for_status()
-            data = resp.content
-            pem = data.decode("ascii", errors="ignore") if b"-----BEGIN CERTIFICATE-----" in data \
-                else ssl.DER_cert_to_PEM_cert(data)
-            ssl.create_default_context(cadata=pem)
+            der = cert_der(resp.content)
+            if der is None:
+                raise ValueError("ответ не похож на сертификат")
+            if "russian trusted" not in cert_cn(der).lower():
+                raise ValueError(f"неожиданный сертификат «{cert_cn(der)}»")
+            ends = cert_not_after(der)
+            if ends and ends <= now_utc():
+                raise ValueError(f"сертификат закончился {ends:%d.%m.%Y}")
         except Exception as exc:
-            print(f"Не удалось скачать {url}: {short_err(exc)}")
+            errors.append(f"{url}: {short_err(exc)}")
             continue
-        (BASE_DIR / name).write_text(pem, encoding="ascii")
-        print(f"Сохранён сертификат: {name}")
+        (BASE_DIR / name).write_text(ssl.DER_cert_to_PEM_cert(der), encoding="ascii")
         saved += 1
+    if saved:
+        BUNDLE_PATH.unlink(missing_ok=True)  # пересоберётся с новыми сертификатами
+    return saved, errors
+
+
+def cmd_setup_cert(cfg: dict) -> int:
+    names = cfg.get("certs", {}).get("ca_files", [])
+    saved, errors = download_mincifry_certs(cfg)
+    for error in errors:
+        print(f"Не удалось скачать {error}")
+    if saved:
+        print(f"Сохранено сертификатов: {saved} ({', '.join(names)})")
     if not saved:
         print("Скачайте сертификаты вручную со страницы https://www.gosuslugi.ru/crt "
               "(«Корневой сертификат» и «Выпускающий сертификат» в формате PEM) и положите рядом со скриптом "
               f"под именами: {', '.join(names)}")
         return 1
-    BUNDLE_PATH.unlink(missing_ok=True)
     http = Http(cfg)
     try:
         http.get("https://zakupki.gov.ru/epz/main/public/home.html")
@@ -3459,6 +3732,8 @@ class BotController:
         self.store = Store(DB_PATH)
         self.cfg: dict = {}
         self.running = threading.Lock()  # одна проверка за раз
+        self.check_started = 0.0
+        self.exit_code: int | None = None  # не None — главный цикл завершает работу (systemd перезапустит)
 
     # --- проверка -----------------------------------------------------------------------------
     def start_check(self, reason: str, *, tell: bool) -> bool:
@@ -3470,7 +3745,13 @@ class BotController:
 
     def _check(self, cfg: dict, reason: str, tell: bool) -> None:
         report: dict = {}
+        self.check_started = time.monotonic()
+        restart = False
         try:
+            store = Store(DB_PATH)
+            notes, restart = maintenance(cfg, store, allow_updates=True)
+            if notes:
+                self.bot.say("Обслуживание: " + "; ".join(notes) + ".")
             run_once(cfg, report=report)
         except Exception as exc:  # бот не должен падать из-за одной проверки
             log.exception("Сбой проверки")
@@ -3481,6 +3762,12 @@ class BotController:
         store.kv_set("last_check", {"at": now_utc().isoformat(), "reason": reason, "report": report})
         if tell or report.get("error") or cfg.get("settings", {}).get("report_each_check", True):
             self.bot.say(report_text(report, reason))
+        if restart:
+            if under_service():
+                self.bot.say("Перезапускаюсь, чтобы начать работать с обновлением.")
+                self.exit_code = 0
+            else:
+                self.bot.say("Обновление установлено. Перезапустите бота, чтобы оно заработало.")
 
     def due(self) -> bool:
         if self.store.kv_get("paused", False):
@@ -3653,16 +3940,28 @@ class BotController:
         self.bot.say("Проверки возобновлены: " + next_slot_text(self.cfg, False) + ".")
 
     # --- главный цикл --------------------------------------------------------------------------
-    def run(self, cfg: dict) -> int:
+    def watchdog(self) -> None:
+        """Проверка идёт дольше CHECK_TIMEOUT: что-то зависло. Перезапуск (systemd поднимет бота заново)."""
+        if self.running.locked() and time.monotonic() - self.check_started > CHECK_TIMEOUT:
+            self.bot.say(f"Проверка идёт дольше {CHECK_TIMEOUT // 60} минут и, похоже, зависла. Перезапускаюсь.")
+            log.error("Проверка зависла, перезапуск")
+            self.exit_code = 3
+
+    def run(self, cfg: dict, startup_notes: list[str] | None = None) -> int:
         self.base_cfg = cfg
         self.cfg = apply_overrides(cfg, self.store)
+        notes = list(startup_notes or [])
+        if self.store.kv_get("alive"):
+            notes.append("Бот перезапущен после сбоя или выключения питания." + (
+                f" Последняя ошибка в журнале: {last_log_error()}" if last_log_error() else ""))
+        self.store.kv_set("alive", True)
         self.bot.call("setMyCommands", commands=[{"command": c, "description": d} for c, d in BOT_COMMANDS])
         # сообщения, пришедшие, пока бот был выключен, не выполняем: это могли быть старые /check
         stale = self.bot.call("getUpdates", timeout=0, offset=-1)
         if stale:
             self.bot.offset = stale[-1]["update_id"] + 1
-        self.bot.say("Бот мониторинга тендеров запущен: " + next_slot_text(self.cfg, self.store.kv_get("paused", False))
-                     + ". Команды — /help")
+        self.bot.say("\n".join(notes + ["Бот мониторинга тендеров запущен: " + next_slot_text(
+            self.cfg, self.store.kv_get("paused", False)) + ". Команды — /help"]))
         log.info("Режим бота: %s", next_slot_text(self.cfg, False))
         while True:
             try:
@@ -3676,14 +3975,40 @@ class BotController:
                 for update in self.bot.updates(timeout=25):
                     if update.get("message"):
                         self.handle(update["message"])
-                os.utime(LOCK_PATH)
+                self.watchdog()
+                try:
+                    os.utime(LOCK_PATH)  # файл блокировки «жив»
+                except OSError:
+                    pass
+                if self.exit_code is not None:
+                    if self.exit_code == 0:
+                        self.store.kv_set("alive", None)
+                    return self.exit_code
             except KeyboardInterrupt:
                 break
             except Exception:
                 log.exception("Сбой в режиме бота, продолжаю")
                 time.sleep(10)
+        self.store.kv_set("alive", None)
         log.info("Бот остановлен")
         return 0
+
+
+CHECK_TIMEOUT = 45 * 60
+
+
+def under_service() -> bool:
+    """Запущен как служба systemd (там после выхода процесс поднимается заново)."""
+    return bool(os.environ.get("INVOCATION_ID"))
+
+
+def last_log_error() -> str:
+    try:
+        lines = LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    errors = [line for line in lines if " ERROR " in line or "Traceback" in line]
+    return truncate(errors[-1], 300) if errors else ""
 
 
 def cmd_bot(cfg: dict) -> int:
@@ -3698,7 +4023,8 @@ def cmd_bot(cfg: dict) -> int:
     if hasattr(signal, "SIGTERM"):
         # systemctl stop присылает SIGTERM: выходим как по Ctrl+C, чтобы убрать файл блокировки
         signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
-    return BotController(TelegramBot(cfg)).run(cfg)
+    repaired = ensure_database()
+    return BotController(TelegramBot(cfg)).run(cfg, [repaired] if repaired else [])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -3744,6 +4070,12 @@ def main(argv: list[str] | None = None) -> int:
     if not acquire_lock(interval):
         log.warning("Проверка уже идёт в другом окне или задаче. Если это не так, удалите файл %s", LOCK_PATH.name)
         return 1
+    repaired = ensure_database()
+    if repaired:
+        announce(build_notifiers(cfg), repaired)
+    notes, _ = maintenance(cfg, Store(DB_PATH), allow_updates=False)
+    for note in notes:
+        log.info("Обслуживание: %s", note)
     if not args.loop:
         return run_once(cfg)
 
@@ -3756,6 +4088,8 @@ def main(argv: list[str] | None = None) -> int:
                 # опечатка в файле, который правят на ходу: работаем со старыми настройками
                 log.error("%s\nПродолжаю с прежними настройками.", exc)
             interval = max(5, int(cfg.get("settings", {}).get("interval_minutes", 30)))
+            for note in maintenance(cfg, Store(DB_PATH), allow_updates=False)[0]:
+                log.info("Обслуживание: %s", note)
             run_once(cfg)
         except KeyboardInterrupt:
             break
