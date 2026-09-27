@@ -62,14 +62,16 @@ except ModuleNotFoundError:
     print("Не хватает библиотек. Установите их командой:\n    pip install requests beautifulsoup4")
     sys.exit(1)
 
-VERSION = "1.1"
+VERSION = "1.2"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.toml"
 DB_PATH = BASE_DIR / "tender_monitor.db"
 LOG_PATH = BASE_DIR / "tender_monitor.log"
 LOCK_PATH = BASE_DIR / "tender_monitor.lock"
 BUNDLE_PATH = BASE_DIR / "ca_bundle_ru.pem"
+ISSUERS_DIR = BASE_DIR / "issuer_certs"  # промежуточные сертификаты, которые сайты не отдают сами
 PROBE_REPORT_PATH = BASE_DIR / "probe_report.txt"
+PROBE_PAGES_DIR = BASE_DIR / "probe_pages"  # страницы компаний, сохранённые --probe для разбора вёрстки
 
 BOT_NAME = "TenderMonitor"
 USER_AGENT = (
@@ -123,6 +125,9 @@ region_words = [
   "таганрог", "волгодонск", "новочеркасск", "батайск", "сальск", "каменск-шахтинск",
   "миллерово", "морозовск", "цимлянск", "зерноград",
   "камышин", "котлубан", "урюпинск", "фролово", "калач-на-дону", "ахтубинск", "харабал",
+  # южные дочерние общества ЛУКОЙЛа: у тендеров на lukoil.ru указан только заказчик
+  # («ЛУКОЙЛ-Волгограднефтепереработка», «ЛУКОЙЛ-Кубаньэнерго» узнаются по словам выше)
+  "югнефтепродукт", "нижневолжскнефт", "ростовэнерго",
 ]
 
 # Регионы в адресах РосТендера (rostender.info/region/...). По ним точно определяется
@@ -395,13 +400,15 @@ page_size = 10
 pages = 200
 every_minutes = 240
 
-# «Степь» тоже сортирует по сроку подачи; открытые закупки помещаются на 2 страницы.
+# «Степь» тоже сортирует по сроку подачи. В сентябре 2026 открытые закупки
+# перестали помещаться на 2 страницы; скрипт остановится сам, когда пойдут повторы.
 [[sources]]
 name = "Агрохолдинг «Степь»"
 type = "html"
 url = "https://www.ahstep.ru/tender"
 page_url = "https://www.ahstep.ru/tender?page={page}"
-pages = 2
+pages = 5
+every_minutes = 60
 
 [[sources]]
 name = "Агрокомплекс им. Ткачёва"
@@ -435,7 +442,8 @@ name = "ЕвроХим: БМУ и ВолгаКалий"
 type = "html"
 url = "https://zakupki.eurochem.ru/aktualnye-zakupki1"
 page_url = "https://zakupki.eurochem.ru/aktualnye-zakupki1?cat_page={page}"
-pages = 3
+pages = 8
+every_minutes = 60
 require = ["бму", "белореченск", "волгакалий", "волгасервис", "котельников"]
 
 [[sources]]
@@ -542,6 +550,9 @@ def strip_html(text: str) -> str:
         if "<" not in text and "&lt;" not in text and "&amp;" not in text:
             break
         text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</li>|</tr>", "\n", text)
+        # ЕИС подсвечивает найденную основу слова: «<span class='highlightColor'>зачистк</span>е».
+        # Строчные теги убираем без пробела, иначе получится «зачистк е»
+        text = re.sub(r"(?i)</?(?:span|b|strong|i|em|u|font|mark|sup|sub)\b[^>]*>", "", text)
         text = re.sub(r"<[^>]+>", " ", text)
         text = htmllib.unescape(text)
     lines = [clean(line) for line in text.splitlines()]
@@ -884,6 +895,83 @@ def prepare_bundle(cfg: dict) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Недостающие промежуточные сертификаты
+# ---------------------------------------------------------------------------
+# Многие сайты отдают только свой сертификат, без промежуточного. Браузер докачивает
+# промежуточный по ссылке из самого сертификата (расширение Authority Information Access),
+# а Python — нет, и получается «unable to get local issuer certificate». Скрипт делает
+# так же, как браузер. Проверка подлинности не отключается: скачанный сертификат только
+# достраивает цепочку до корневого, которому система и так доверяет. Корневые сертификаты
+# (выписанные сами себе) не принимаются, а скачанное применяется только к тому сайту,
+# которому понадобилось.
+
+CA_ISSUERS_OID = bytes.fromhex("06082b06010505073002")  # 1.3.6.1.5.5.7.48.2 id-ad-caIssuers
+
+
+def _der_element(data: bytes, pos: int) -> tuple[int, int, int]:
+    """(тег, начало содержимого, конец элемента) для элемента DER в позиции pos."""
+    tag = data[pos]
+    length = data[pos + 1]
+    pos += 2
+    if length & 0x80:
+        n = length & 0x7F
+        length = int.from_bytes(data[pos:pos + n], "big")
+        pos += n
+    if pos + length > len(data):
+        raise ValueError("обрезанный сертификат")
+    return tag, pos, pos + length
+
+
+def ca_issuer_urls(der: bytes) -> list[str]:
+    """Адреса, где лежит сертификат издателя (caIssuers из Authority Information Access)."""
+    urls = []
+    start = 0
+    while (i := der.find(CA_ISSUERS_OID, start)) != -1:
+        start = i + len(CA_ISSUERS_OID)
+        if start < len(der) and der[start] == 0x86:  # uniformResourceIdentifier
+            _, a, b = _der_element(der, start)
+            url = der[a:b].decode("ascii", errors="ignore")
+            if url.startswith(("http://", "https://")):
+                urls.append(url)
+    return urls
+
+
+def cert_names(der: bytes) -> tuple[bytes, bytes]:
+    """(издатель, владелец) сертификата в виде DER."""
+    _, pos, _ = _der_element(der, 0)       # Certificate
+    _, pos, end = _der_element(der, pos)   # TBSCertificate
+    fields = []
+    while pos < end and len(fields) < 6:
+        _, _, nxt = _der_element(der, pos)
+        fields.append(der[pos:nxt])
+        pos = nxt
+    if fields and fields[0][0] == 0xA0:    # [0] version есть не всегда
+        fields = fields[1:]
+    if len(fields) < 5:
+        raise ValueError("не сертификат")
+    return fields[2], fields[4]            # serial, signature, issuer, validity, subject
+
+
+def cert_der(content: bytes) -> bytes | None:
+    """Сертификат из ответа сервера (DER или PEM); None, если это не один сертификат X.509."""
+    try:
+        if b"-----BEGIN CERTIFICATE-----" in content:
+            text = content.decode("ascii", errors="ignore")
+            block = text[text.index("-----BEGIN CERTIFICATE-----"):]
+            block = block[:block.index("-----END CERTIFICATE-----") + len("-----END CERTIFICATE-----")]
+            content = ssl.PEM_cert_to_DER_cert(block)
+        cert_names(content)
+        ssl.create_default_context(cadata=content)  # PKCS#7 и мусор здесь отсеются
+        return content
+    except (ValueError, IndexError, ssl.SSLError):
+        return None
+
+
+def _host_file(host: str, suffix: str) -> Path:
+    return ISSUERS_DIR / (re.sub(r"[^\w.-]", "_", host.lower()) + suffix)
+
+
+# ---------------------------------------------------------------------------
 # Загрузка страниц
 # ---------------------------------------------------------------------------
 
@@ -952,10 +1040,86 @@ class Http:
         self.robots: dict[str, Robots | None] = {}
         self.last_hit: dict[str, float] = {}
         self.down: dict[str, str] = {}  # сайты, которые не ответили в эту проверку
+        self.host_bundles: dict[str, str] = {}
+        self.issuer_tried: set[str] = set()
+
+    def _base_bundle(self, host: str) -> str:
+        if self.bundle and is_ru_zone(host):
+            return self.bundle
+        return requests.certs.where()
+
+    def _host_bundle(self, host: str) -> str | None:
+        """Файл доверенных сертификатов для сайта, которому докачан промежуточный сертификат."""
+        if host in self.host_bundles:
+            return self.host_bundles[host]
+        extra = _host_file(host, ".crt")
+        if not extra.is_file():
+            return None
+        path = _host_file(host, ".bundle.pem")
+        try:
+            base = Path(self._base_bundle(host)).read_text(encoding="ascii", errors="ignore")
+            path.write_text(base.strip() + "\n" + extra.read_text(encoding="ascii").strip() + "\n", encoding="ascii")
+            ssl.create_default_context(cafile=str(path))
+        except (OSError, ssl.SSLError) as exc:
+            log.warning("%s: не удалось собрать файл сертификатов (%s)", host, short_err(exc))
+            return None
+        self.host_bundles[host] = str(path)
+        return str(path)
 
     def verify_for(self, url: str):
         host = urlparse(url).hostname or ""
+        own = self._host_bundle(host)
+        if own:
+            return own
         return self.bundle if (self.bundle and is_ru_zone(host)) else True
+
+    def fetch_missing_issuer(self, url: str) -> bool:
+        """Докачивает промежуточные сертификаты сайта. True — есть новые, запрос стоит повторить."""
+        parts = urlparse(url)
+        host = parts.hostname or ""
+        if not host or host in self.issuer_tried:
+            return False
+        self.issuer_tried.add(host)
+        if self.session.proxies.get("https"):
+            log.info("%s: промежуточный сертификат не докачивается при работе через прокси", host)
+            return False
+        try:
+            pem = ssl.get_server_certificate((host, parts.port or 443), timeout=15)
+            der = ssl.PEM_cert_to_DER_cert(pem)
+        except (OSError, ValueError) as exc:
+            log.info("%s: не удалось прочитать сертификат сайта (%s)", host, short_err(exc))
+            return False
+        extra = _host_file(host, ".crt")
+        known = extra.read_text(encoding="ascii") if extra.is_file() else ""
+        added = []
+        for _ in range(3):  # сайт → промежуточный → ещё один промежуточный
+            issuer_der = None
+            for issuer_url in ca_issuer_urls(der):
+                try:
+                    resp = self.session.get(issuer_url, timeout=(10, 20))
+                except requests.RequestException as exc:
+                    log.info("%s: %s не скачался (%s)", host, issuer_url, describe_request_error(exc))
+                    continue
+                if resp.status_code == 200:
+                    issuer_der = cert_der(resp.content)
+                    if issuer_der:
+                        break
+            if not issuer_der:
+                break
+            issuer, subject = cert_names(issuer_der)
+            if issuer == subject:
+                break  # дошли до корневого: ему доверяем, только если он уже есть в системе
+            pem = ssl.DER_cert_to_PEM_cert(issuer_der)
+            if pem not in known:
+                added.append(pem)
+                log.info("%s: докачан промежуточный сертификат с %s", host, issuer_url)
+            der = issuer_der
+        if not added:
+            return False
+        ISSUERS_DIR.mkdir(exist_ok=True)
+        extra.write_text(known + "".join(added), encoding="ascii")
+        self.host_bundles.pop(host, None)
+        return True
 
     def _pace(self, url: str) -> None:
         host = urlparse(url).hostname or ""
@@ -1001,7 +1165,14 @@ class Http:
             try:
                 resp = self.session.get(url, timeout=(15, 45), verify=self.verify_for(url))
             except requests.exceptions.SSLError as exc:
-                if "certificate verify failed" in str(exc).lower():
+                low = str(exc).lower()
+                if "certificate verify failed" in low:
+                    if "hostname mismatch" in low or "doesn't match" in low or "not valid for" in low:
+                        raise FetchError(
+                            "сертификат сайта выписан на другой адрес: сайт переехал или настроен с ошибкой"
+                        ) from exc
+                    if "local issuer" in low and self.fetch_missing_issuer(url):
+                        continue  # докачали промежуточный сертификат — повторяем с ним
                     if is_ru_zone(host) and not self.bundle:
                         raise FetchError(
                             "сайт использует сертификат Минцифры. Выполните: python tender_monitor.py --setup-cert"
@@ -1238,7 +1409,12 @@ LABEL_RE = re.compile(
     r"(?i)^(?:№|номер|заказчик|организатор|документ|при[её]м заявок|дата|срок|статус|принять участие|подробнее"
     r"|способ|регион|место|окончание|начальная цена)"
 )
-FILE_HREF_RE = re.compile(r"(?i)/filesystem/|\.(?:zip|rar|7z|docx?|xlsx?|pdf|rtf|odt)(?:[?#]|$)")
+FILE_HREF_RE = re.compile(
+    r"(?i)/filesystem/|/upload/|\.(?:zip|rar|7z|docx?|xlsx?|pptx?|pdf|rtf|odt|ods|txt|csv|sig|p7s"
+    r"|jpe?g|png|gif|bmp|tiff?|webp|dwg|dxf|gsfx)(?:[?#]|$)"
+)
+# Текст ссылки — имя файла: «шильд М1 поворота.jpg», «КЖ-Навес к закупке.gsfx»
+FILE_NAME_RE = re.compile(r"(?i)\.[a-z][a-z0-9]{1,4}$")
 JS_APP_RE = re.compile(
     r"(?i)id=[\"'](?:app|root|__next|__nuxt)[\"']|__NEXT_DATA__|window\.__NUXT__|ng-version=|data-reactroot"
 )
@@ -1543,14 +1719,14 @@ def _generic_items(src: Source, soup, base: str, host: str) -> list[Item]:
         seen_titles.add(key)
         candidates.append((title[:400], full, clean(VOLATILE_RE.sub(" ", block))[:1500], link))
 
-    for heading in soup.find_all(HEADINGS):
+    for heading in soup.find_all(HEADINGS[1:]):  # h1 — заголовок самой страницы («Тендеры и закупки»)
         anchor = heading.find("a", href=True)
         link = (safe_urljoin(base, anchor["href"]) if anchor else None) or base
         add(heading.get_text(" ", strip=True), _heading_block(heading), link)
     for anchor in soup.find_all("a", href=True):
         text = anchor.get_text(" ", strip=True)
         href = anchor["href"].strip()
-        if len(text) < 20 or FILE_HREF_RE.search(href):
+        if len(text) < 20 or FILE_HREF_RE.search(href) or FILE_NAME_RE.search(text):
             continue
         link = None if href.startswith(("javascript:", "mailto:", "tel:", "#")) else safe_urljoin(base, href)
         add(text, _container_text(anchor), link or base)
@@ -1561,7 +1737,7 @@ def _generic_items(src: Source, soup, base: str, host: str) -> list[Item]:
         if any(len(a.get_text(strip=True)) >= 20 for a in el.find_all("a")):
             continue
         text = el.get_text(" ", strip=True)
-        if 25 <= len(text) <= 1200:
+        if 25 <= len(text) <= 1200 and not FILE_NAME_RE.search(text):
             add(text[:300], text, base)
 
     # Если одна строка целиком входит в другую (заголовок и весь блок вокруг него),
@@ -2357,8 +2533,13 @@ def probe_hint(src: Source, info: dict, error: str) -> str:
                        "(proxy в [settings]).")
     if "сертификат Минцифры" in error:
         return "Выполните: python tender_monitor.py --setup-cert"
+    if "выписан на другой адрес" in error:
+        return ("Откройте адрес в браузере: если браузер тоже предупреждает о сертификате, сайт настроен "
+                "с ошибкой. Если сайт переехал, поменяйте url; иначе источник лучше выключить (enabled = false).")
     if "ошибка сертификата" in error and is_ru_zone(host):
-        return "Возможно, сайт перешёл на сертификат Минцифры: выполните python tender_monitor.py --setup-cert"
+        return ("Скрипт уже пробовал докачать промежуточный сертификат сайта. Если --setup-cert ещё не "
+                "выполнялся, выполните python tender_monitor.py --setup-cert. Если ошибка останется, "
+                "откройте адрес в браузере: при предупреждении о сертификате источник лучше выключить.")
     if "не найдено ни одного тендера" in error:
         html = info.get("html", "")
         text_len = len(BeautifulSoup(html, "html.parser").get_text(" ", strip=True)) if html else 0
@@ -2372,7 +2553,25 @@ def probe_hint(src: Source, info: dict, error: str) -> str:
         return "Адрес устарел: найдите на сайте компании новую страницу закупок и поменяйте url."
     if "HTTP 403" in error or "оборвал соединение" in error:
         return "Сайт не пускает автоматические запросы или зарубежные IP-адреса."
+    if "адрес сайта не найден" in error:
+        return ("Откройте адрес в браузере. Если не открывается и там, компания сменила сайт: найдите новую "
+                "страницу закупок и поменяйте url или выключите источник (enabled = false).")
+    if "не ответил вовремя" in error:
+        return ("Сайт отвечает слишком медленно. Если ошибка повторяется при следующих проверках, откройте "
+                "адрес в браузере: возможно, сайт не работает или не пускает зарубежные IP-адреса.")
     return ""
+
+
+def save_probe_page(src: Source, html: str) -> str:
+    """Сохраняет первую страницу источника: если разбор ошибся, её можно прислать вместе с отчётом."""
+    name = re.sub(r"[^\w-]+", "_", src.name).strip("_")[:60] or "page"
+    try:
+        PROBE_PAGES_DIR.mkdir(exist_ok=True)
+        (PROBE_PAGES_DIR / f"{name}.html").write_text(html, encoding="utf-8")
+    except OSError as exc:
+        log.debug("не удалось сохранить страницу %s: %s", src.name, exc)
+        return ""
+    return f"{PROBE_PAGES_DIR.name}/{name}.html"
 
 
 def cmd_probe(cfg: dict, name_filter: str = "") -> int:
@@ -2453,6 +2652,9 @@ def cmd_probe(cfg: dict, name_filter: str = "") -> int:
             forms = describe_forms(info["html"])
             if forms:
                 out("    фильтры на странице: " + "; ".join(truncate(f, 160) for f in forms))
+            saved = save_probe_page(src, info["html"])
+            if saved:
+                out(f"    страница сохранена: {saved}")
     out()
     out(f"Итого: работают {ok} из {len(sources)}, с ошибкой {failed}, пустых сейчас {empty}.")
     try:

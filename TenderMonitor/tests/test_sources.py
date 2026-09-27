@@ -39,6 +39,20 @@ STRICT = dict(SETTINGS, max_age_days=0)                        # регион у
 LOOSE = dict(SETTINGS, max_age_days=0, only_my_regions=False)  # только слова
 
 
+ISSUERS_TMP = tempfile.TemporaryDirectory()
+tm.ISSUERS_DIR = Path(ISSUERS_TMP.name) / "issuer_certs"  # тесты не трогают папку со скриптом
+
+
+@contextlib.contextmanager
+def patched(obj, name, value):
+    original = getattr(obj, name)
+    setattr(obj, name, value)
+    try:
+        yield
+    finally:
+        setattr(obj, name, original)
+
+
 class FakeResponse:
     status_code = 200
 
@@ -232,6 +246,8 @@ class Lukoil(unittest.TestCase):
     def test_matching(self):
         self.assertEqual(wanted(self.items, LOOSE), ["html:lukoil.ru:1234-26", "html:lukoil.ru:050-0040-26"])
         self.assertEqual(REGIONS.classify(self.items[3]), "my")  # Волгограднефтепереработка
+        self.assertEqual(REGIONS.classify(self.items[1]), "my")  # Югнефтепродукт
+        self.assertEqual(REGIONS.classify(self.items[0]), "unknown")  # головная компания
 
 
 class EuroChem(unittest.TestCase):
@@ -257,6 +273,8 @@ class GenericPage(unittest.TestCase):
         self.assertEqual(len(items), 3)
         self.assertEqual([i.title for i in items if tm.evaluate(i, MATCHER, REGIONS, STRICT)],
                          ["№18 Зачистка резервуаров дизельного топлива на территории терминала"])
+        # приложенные файлы и заголовок страницы — не тендеры
+        self.assertFalse(any(t.endswith((".jpg", ".gsfx", ".docx")) or t == "Тендеры и закупки" for t in titles))
 
     def test_javascript_page_is_an_error(self):
         url = "https://goldenseed.ru/tenders"
@@ -351,24 +369,30 @@ class Probe(unittest.TestCase):
         cfg["sources"] = [
             {"name": "РТ лента", "type": "rss", "url": "https://rostender.info/rss-category-839.xml"},
             {"name": "Юг Руси сайт", "type": "html", "url": "https://goldenseed.ru/tenders"},
+            {"name": "КСК сайт", "type": "html", "url": "https://www.gt-ksk.com/about/tenders/"},
         ]
         routes = {"https://rostender.info/rss-category-839.xml": "rostender_rss.xml",
-                  "https://goldenseed.ru/tenders": "js_app.html"}
-        original_http, original_path = tm.Http, tm.PROBE_REPORT_PATH
+                  "https://goldenseed.ru/tenders": "js_app.html",
+                  "https://www.gt-ksk.com/about/tenders/": "ksk.html"}
+        original_http, original_path, original_pages = tm.Http, tm.PROBE_REPORT_PATH, tm.PROBE_PAGES_DIR
         with tempfile.TemporaryDirectory() as tmp:
             tm.Http = lambda cfg: FakeHttp(routes)
             tm.PROBE_REPORT_PATH = Path(tmp) / "probe_report.txt"
+            tm.PROBE_PAGES_DIR = Path(tmp) / "probe_pages"
             try:
                 with contextlib.redirect_stdout(io.StringIO()):
                     code = tm.cmd_probe(cfg)
                 report = tm.PROBE_REPORT_PATH.read_text(encoding="utf-8")
+                pages = sorted(p.name for p in tm.PROBE_PAGES_DIR.iterdir())
             finally:
-                tm.Http, tm.PROBE_REPORT_PATH = original_http, original_path
+                tm.Http, tm.PROBE_REPORT_PATH, tm.PROBE_PAGES_DIR = original_http, original_path, original_pages
         self.assertEqual(code, 1)
         self.assertIn("✓ РТ лента: записей 4", report)
         self.assertIn("Оказание услуг по зачистке ёмкостей (резервуаров) для хранения ГСМ", report)
         self.assertIn("✗ Юг Руси сайт", report)
         self.assertIn("JavaScript", report)
+        self.assertIn("страница сохранена: probe_pages/КСК_сайт.html", report)
+        self.assertEqual(pages, ["КСК_сайт.html"])
 
 
 class EdgeCases(unittest.TestCase):
@@ -421,10 +445,29 @@ class EdgeCases(unittest.TestCase):
             raise requests.exceptions.SSLError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
                                                "unable to get local issuer certificate")
 
+        def no_site(*args, **kwargs):
+            raise OSError("нет сети")
+
+        http.session.get = boom
+        with patched(tm.ssl, "get_server_certificate", no_site):
+            with self.assertRaises(tm.FetchError) as ctx:
+                http.get("https://aston.ru/tenders/current-purchases/")
+        self.assertIn("--setup-cert", str(ctx.exception))
+
+    def test_hostname_mismatch_is_not_a_mincifry_problem(self):
+        import requests
+        http = tm.Http(CFG)
+
+        def boom(*args, **kwargs):
+            raise requests.exceptions.SSLError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+                                               "Hostname mismatch, certificate is not valid for 'gas.crimea.ru'.")
+
         http.session.get = boom
         with self.assertRaises(tm.FetchError) as ctx:
-            http.get("https://aston.ru/tenders/current-purchases/")
-        self.assertIn("--setup-cert", str(ctx.exception))
+            http.get("https://gas.crimea.ru/gosudarstvennye-zakupki")
+        self.assertIn("выписан на другой адрес", str(ctx.exception))
+        src = source({"name": "Ч", "type": "html", "url": "https://gas.crimea.ru/gosudarstvennye-zakupki"})
+        self.assertNotIn("--setup-cert", tm.probe_hint(src, {}, str(ctx.exception)))
 
     def test_config_typo_raises_config_error(self):
         original = tm.CONFIG_PATH
@@ -515,6 +558,91 @@ class EdgeCases(unittest.TestCase):
         store.mark_seen(fixed)
         store.mark_sent("fp", fixed.uid)
         self.assertFalse(store.needs_check(tm.Item(uid=first.uid, title="Третье название", link="", source="ЛУКОЙЛ")))
+
+
+class MissingIntermediate(unittest.TestCase):
+    """Сайт отдаёт только свой сертификат, без промежуточного (как aston.ru и oteko.ru в сентябре 2026).
+
+    Сертификаты в fixtures/certs тестовые: корневой «Test Root CA», промежуточный «Test Intermediate CA»
+    и сертификат сайта localhost со ссылкой на промежуточный http://pki.test/int.crt.
+    """
+    CERTS = FIX / "certs"
+
+    def setUp(self):
+        self.site_pem = (self.CERTS / "site.pem").read_text(encoding="ascii")
+        self.site = tm.ssl.PEM_cert_to_DER_cert(self.site_pem)
+        self.intermediate = (self.CERTS / "intermediate.der").read_bytes()
+        self.root = (self.CERTS / "root.der").read_bytes()
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.enterContext(patched(tm, "ISSUERS_DIR", Path(self.dir.name) / "issuer_certs"))
+        self.enterContext(patched(tm.ssl, "get_server_certificate", lambda addr, timeout=None: self.site_pem))
+
+    def http(self, served: dict[str, bytes]):
+        import requests
+        http = tm.Http(CFG)
+        http.calls = []
+
+        def get(url, **kwargs):
+            http.calls.append(url)
+            resp = requests.Response()
+            resp.status_code = 200 if url in served else 404
+            resp._content = served.get(url, b"")
+            return resp
+
+        http.session.get = get
+        return http
+
+    def test_der_parsing(self):
+        self.assertEqual(tm.ca_issuer_urls(self.site), ["http://pki.test/int.crt"])  # OCSP не берём
+        self.assertEqual(tm.ca_issuer_urls(self.intermediate), ["http://pki.test/root.crt"])
+        issuer, subject = tm.cert_names(self.root)
+        self.assertEqual(issuer, subject)
+        issuer, subject = tm.cert_names(self.intermediate)
+        self.assertNotEqual(issuer, subject)
+        self.assertEqual(tm.cert_der(tm.ssl.DER_cert_to_PEM_cert(self.intermediate).encode()), self.intermediate)
+        self.assertIsNone(tm.cert_der(b"<html>404</html>"))
+        self.assertIsNone(tm.cert_der(b"\x30\x03\x02\x01\x01"))
+
+    def test_intermediate_is_saved_root_is_not(self):
+        http = self.http({"http://pki.test/int.crt": self.intermediate, "http://pki.test/root.crt": self.root})
+        self.assertTrue(http.fetch_missing_issuer("https://aston.ru/tenders/"))
+        saved = (tm.ISSUERS_DIR / "aston.ru.crt").read_text(encoding="ascii")
+        self.assertEqual(saved.count("BEGIN CERTIFICATE"), 1)
+        self.assertEqual(tm.ssl.PEM_cert_to_DER_cert(saved), self.intermediate)
+        # сертификат применяется только к своему сайту
+        bundle = http.verify_for("https://aston.ru/tenders/")
+        self.assertIsInstance(bundle, str)
+        self.assertIn(saved.strip(), Path(bundle).read_text(encoding="ascii"))
+        self.assertNotIn(bundle, (http.verify_for("https://www.oteko.ru/x"), http.verify_for("https://example.com/")))
+        # второй раз за проверку сайт не опрашивается
+        self.assertFalse(http.fetch_missing_issuer("https://aston.ru/other"))
+
+    def test_self_signed_answer_is_rejected(self):
+        http = self.http({"http://pki.test/int.crt": self.root})  # вместо промежуточного подсунули корневой
+        self.assertFalse(http.fetch_missing_issuer("https://aston.ru/tenders/"))
+        self.assertFalse(tm.ISSUERS_DIR.exists())
+
+    def test_get_retries_with_downloaded_intermediate(self):
+        import requests
+        http = self.http({"http://pki.test/int.crt": self.intermediate})
+        fetch_get = http.session.get
+        verified_with = []
+
+        def get(url, **kwargs):
+            if "pki.test" in url:
+                return fetch_get(url, **kwargs)
+            verified_with.append(kwargs.get("verify"))
+            if kwargs.get("verify") is True:
+                raise requests.exceptions.SSLError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+                                                   "unable to get local issuer certificate (_ssl.c:1081)")
+            return FakeResponse(url, b"<html></html>", "text/html; charset=utf-8")
+
+        http.session.get = get
+        with patched(tm.time, "sleep", lambda s: None):
+            http.get("https://aston.example/tenders/")
+        self.assertEqual(verified_with[0], True)
+        self.assertTrue(str(verified_with[1]).endswith("aston.example.bundle.pem"))
 
 
 if __name__ == "__main__":

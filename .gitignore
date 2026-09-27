@@ -5,3 +5,7 @@ TenderMonitor/tender_monitor.log
 TenderMonitor/probe_report.txt
 TenderMonitor/cron.log
 TenderMonitor/*.crt
+TenderMonitor/tender_monitor.lock
+TenderMonitor/ca_bundle_ru.pem
+TenderMonitor/issuer_certs/
+TenderMonitor/probe_pages/
