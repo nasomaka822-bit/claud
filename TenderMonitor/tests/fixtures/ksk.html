@@ -1,17 +1,333 @@
 <!DOCTYPE html>
-<html lang="ru"><head><meta charset="utf-8"><title>Тендеры — АО «КСК»</title></head>
+<html lang="ru">
+<head>
+    <title>Тендеры и закупки</title>
+    <meta charset="UTF-8">
+</head>
 <body>
-<nav><a href="/about">О компании АО «КСК» и зерновом терминале</a></nav>
-<h1>Тендеры и закупки</h1>
-<!-- Как на gt-ksk.com 27.09.2026: у закупок нет своих ссылок, новые сверху,
-     к закупкам приложены файлы из /upload/iblock/ с именем файла в тексте ссылки -->
-<div class="tenders">
-  <div class="tender"><div class="tender__title">№17 Капитальный ремонт силосов зернохранилища общей вместимостью 110 000 тонн</div><div class="tender__dates">01.09.2026–14.09.2026</div><div class="tender__status">Завершена</div></div>
-  <div class="tender"><div class="tender__title">№18 Зачистка резервуаров дизельного топлива на территории терминала</div><div class="tender__dates">25.09.2026–05.10.2026</div><div class="tender__status">Приём заявок</div>
-    <div class="tender__price">Стоимость закупки: 782609</div>
-    <div class="tender__files"><a href="/upload/iblock/e8b/faozyejcdrhe9x86gy0kpypa14l7vk15.jpg">шильд М1 поворота.jpg</a>
-    <a href="/upload/iblock/680/acbl1bbi65c70uvyedcaln2bnakf94g9.gsfx">КЖ-Навес к закупке.gsfx</a>
-    <a href="/upload/iblock/123/techzadanie.docx">Техническое задание на зачистку резервуаров.docx</a></div></div>
-  <div class="tender"><div class="tender__title">№16 Модернизация пожарного водопровода АО «КСК»</div><div class="tender__dates">21.08.2026–31.08.2026</div><div class="tender__status">Завершена</div></div>
+<!-- Сокращённая страница https://www.gt-ksk.com/about/tenders/ от 27.09.2026 (всего на ней 543 закупки с 2014 года).
+     Каждая закупка в div.tenders-block, своей ссылки у неё нет, документы лежат в /upload/iblock/.
+     Статус «Действующая» не обновляется: он стоит и у закупок 2019–2023 годов. -->
+<div class="tenders__content-wrap active">
+    <div class='_container'>
+        <h2 class="mob-tabs-title">Тендеры
+            и закупки</h2>
+<div class="tenders__row">
+<div class="tenders__row-item">
+<span>Положение о закупке товаров, работ, услуг</span>
+<a class="tenders__down-btn down-btn black" href="/upload/polozheniye_o_zakupke_tovarov_rabot_uslug__prikazom_46_ot_12_04_2024.pdf" target="_blank"></a>
+</div>
+<div class="tenders__row-item">
+<span>План закупок 2026</span>
+<a class="tenders__down-btn down-btn black" href="/upload/plan_zakupok_2026.pdf" target="_blank"></a>
+</div>
+</div>
+<form action="#" class="tenders__search tenders-search for-mob">
+<div class="tenders-search__input">
+<div class="tenders-search__arrow"></div>
+<input disabled="" placeholder="Подразделение" type="text"/>
+<ul class="tenders-search__list">
+<li class="tenders-search__list-title">Подразделение</li>
+<li class="tenders-search__list-item">Все</li>
+<li class="tenders-search__list-item">Юридический отдел</li>
+<li class="tenders-search__list-item">Отдел механизации</li>
+<li class="tenders-search__list-item">Экология</li>
+<li class="tenders-search__list-item">ОКС</li>
+<li class="tenders-search__list-item">Отдел снабжения</li>
+<li class="tenders-search__list-item">Охрана труда</li>
+<li class="tenders-search__list-item">Служба главного инженера</li>
+<li class="tenders-search__list-item">Транспортный отдел</li>
+<li class="tenders-search__list-item">Отдел информационных технологий</li>
+</ul>
+</div>
+<div class="tenders-search__input">
+<div class="tenders-search__arrow"></div>
+<input disabled="" placeholder="Способ закупки" type="text"/>
+<ul class="tenders-search__list">
+<li class="tenders-search__list-title">Способ закупки</li>
+<li class="tenders-search__list-item">Все</li>
+<li class="tenders-search__list-item">Открытый запрос предложений</li>
+<li class="tenders-search__list-item">Открытый запрос котирвок цен</li>
+<li class="tenders-search__list-item">Прямая закупка (У единственного поставщика)
+                            </li>
+<li class="tenders-search__list-item">Закрытый запрос предложений</li>
+<li class="tenders-search__list-item">Внутригрупповая закупка</li>
+<li class="tenders-search__list-item">Безальтернативная закупка</li>
+</ul>
+</div>
+<div class="tenders-search__input">
+<div class="tenders-search__arrow"></div>
+<input disabled="" placeholder="Статус закупки" type="text"/>
+<ul class="tenders-search__list">
+<li class="tenders-search__list-title">Статус закупки</li>
+<li class="tenders-search__list-item">Действующая</li>
+<li class="tenders-search__list-item">Завершена</li>
+</ul>
+</div>
+<div class="tenders-search__input">
+<div class="tenders-search__arrow"></div>
+<input disabled="" placeholder="Стоимость контракта" type="text"/>
+<ul class="tenders-search__list">
+<li class="tenders-search__list-title">Стоимость контракта</li>
+<li class="tenders-search__list-item">До 1 000 000</li>
+<li class="tenders-search__list-item">До 5 000 000</li>
+<li class="tenders-search__list-item">До 10 000 000</li>
+<li class="tenders-search__list-item">Свыше 10 000 000</li>
+</ul>
+</div>
+<button class="tenders-search__btn" type="submit"></button>
+</form>
+        <div class="tenders__wrap swiper-slide">
+<div class="tenders__block tenders-block">
+<div class="tenders-block__wrap spoller__title">
+<div class="tenders-block__item">
+<div class="tenders-block__status">
+<div class="tenders-block__status-text">Завершена</div>
+<div class="tenders-block__status-num">№17</div>
+</div>
+</div>
+<div class="tenders-block__info">
+<div class="tenders-block__date">01.09.2026 12:51:00—14.09.2026</div>
+<div class="tenders-block__text">Капитальный ремонт силосов зернохранилища общей вместимостью 110 000 тонн (ремонт примыканий фундамента и стенки силосов)</div>
+<div class="tenders-block__row">
+<div class="tenders-block__row-item">
+<span> Подразделение:</span>
+</div>
+<div class="tenders-block__row-item">
+<span>Способ закупки:</span>
+                        открытый запрос предложений                    </div>
+</div>
+</div>
+<button class="show-btn spoller">
+<span class="show-btn__text">Раскрыть</span>
+<span class="show-btn__icon"></span>
+</button>
+</div>
+<div class="tenders-block__hide spoller__text">
+<div class="tenders-block__row-item">
+<span> Стоимость закупки:</span>
+                8 393 483,67 руб. с НДС 22%            </div>
+<ul class="tenders-block__list">
+<li><a class="tenders-block__list-link" href="/upload/iblock/1bb/fe57hxwhtrcxjtrdt1s207fpa1ebtwoo.xlsx">Кап.ремонт силосов на 110тыс.тонн.xlsx</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/e84/cehd0k0kzd0jf7h06rw8sz20yul5ho1f.docx">КСК- ДОГОВОР ПОДРЯДА (С КОНТРОЛЕМ, С АВАНСОМ).docx</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/b11/bw0575hwe6nieknaq2rxf61ps413w22f.pdf">Планово-высотное положение силосов.pdf</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/dd1/gz5pqmweao1clwupf6ye978t6730tayt.docx">Приложение № 3 - Форма Акта ПП СП КСК (защищен.ред.).docx</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/ab3/14vgoru16l8e3wflc45365hh27zakvts.docx">Приложение №4 - О безопасности КСК (защищен.ред.).docx</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/3f8/hq1bn5w3tm8cagcqp9vydxb3he7h0ysk.docx">КСК- ДОГОВОР ПОДРЯДА (С КОНТРОЛЕМ, БЕЗ АВАНСА).docx</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/657/y5llj90yvdihzllzdf2dek8n7ctqm3te.pdf">ТЗ ДелоПортс Кап. ремонт зернохран. 110 000т АК КСК.pdf</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/393/a3tdp9xa0n9zudy85zqj42whp0fl6hyf.pdf">Типовая схема ремонта силосов.pdf</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/260/5qke2metkcql96plavco32nw1z5a7u4t.docx">Закупочная документация.docx</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/bb2/cxo0hww1v5cewdt1ntqbol169a0dwm2a.gsfx">Кап.ремонт силосов на 110тыс.тонн.gsfx</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/55b/zes3aer2g1p4nvkxce3y4l50mtohx3vx.docx">Протокол подведения итогов.docx</a>
+</li>
+</ul>
+</div>
+</div>
+<div class="tenders__block tenders-block">
+<div class="tenders-block__wrap spoller__title">
+<div class="tenders-block__item">
+<div class="tenders-block__status">
+<div class="tenders-block__status-text">Завершена</div>
+<div class="tenders-block__status-num">№16</div>
+</div>
+</div>
+<div class="tenders-block__info">
+<div class="tenders-block__date">21.08.2026 10:13:00—31.08.2026</div>
+<div class="tenders-block__text">Модернизация пожарного водопровода АО «КСК»</div>
+<div class="tenders-block__row">
+<div class="tenders-block__row-item">
+<span> Подразделение:</span>
+</div>
+<div class="tenders-block__row-item">
+<span>Способ закупки:</span>
+                        открытый запрос предложений                    </div>
+</div>
+</div>
+<button class="show-btn spoller">
+<span class="show-btn__text">Раскрыть</span>
+<span class="show-btn__icon"></span>
+</button>
+</div>
+<div class="tenders-block__hide spoller__text">
+<div class="tenders-block__row-item">
+<span> Стоимость закупки:</span>
+                5 918 559,55 руб. с НДС 22%            </div>
+<ul class="tenders-block__list">
+<li><a class="tenders-block__list-link" href="/upload/iblock/337/6da9ak9mn0jtzl9es4kf749d2vgsrmwh.docx">Закупочная документация.docx</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/adb/jhrc3cdx7dfji4lruejg0xofps3vwmai.docx">ДП КСК -без аванса, с контролем.docx</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/38a/4xkfe5xmtmqa4iyokpk3is2u0owh6qyy.docx">ДП КСК -с авансом, с контролем.docx</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/dd1/gz5pqmweao1clwupf6ye978t6730tayt.docx">Приложение № 3 - Форма Акта ПП СП КСК (защищен.ред.).docx</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/ab3/14vgoru16l8e3wflc45365hh27zakvts.docx">Приложение №4 - О безопасности КСК (защищен.ред.).docx</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/dc6/lni3a5lf41vw3yqm1aoyyemsbb2jaa82.xlsx">Работы по ремонту пожарного трубопровода АО КСК (2кв. 26).xlsx</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/377/rhskyh0p727tm4bh4exjb1osdqoe0i2m.pdf">схема1.pdf</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/283/rqcjay4qb94aj7vu63r8g8cbbarltrpm.pdf">ТЗ Модернизация пожарного водопровода АО КСК.pdf</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/412/dfkhdea9osqtheccrjizm3eokmbnkqf5.docx">Протокол рассмотрения и оценки заявок.docx</a>
+</li>
+</ul>
+</div>
+</div>
+<div class="tenders__block tenders-block">
+<div class="tenders-block__wrap spoller__title">
+<div class="tenders-block__item">
+<div class="tenders-block__status">
+<div class="tenders-block__status-text">Завершена</div>
+<div class="tenders-block__status-num">№15</div>
+</div>
+</div>
+<div class="tenders-block__info">
+<div class="tenders-block__date">24.07.2026 12:30:00—11.08.2026</div>
+<div class="tenders-block__text">Модернизация пожарного водопровода АО «КСК»</div>
+<div class="tenders-block__row">
+<div class="tenders-block__row-item">
+<span> Подразделение:</span>
+</div>
+<div class="tenders-block__row-item">
+<span>Способ закупки:</span>
+                        открытый запрос предложений                    </div>
+</div>
+</div>
+<button class="show-btn spoller">
+<span class="show-btn__text">Раскрыть</span>
+<span class="show-btn__icon"></span>
+</button>
+</div>
+<div class="tenders-block__hide spoller__text">
+<div class="tenders-block__row-item">
+<span> Стоимость закупки:</span>
+                5 918 559,55 руб. с НДС 22%            </div>
+<ul class="tenders-block__list">
+<li><a class="tenders-block__list-link" href="/upload/iblock/adb/jhrc3cdx7dfji4lruejg0xofps3vwmai.docx">ДП КСК -без аванса, с контролем.docx</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/38a/4xkfe5xmtmqa4iyokpk3is2u0owh6qyy.docx">ДП КСК -с авансом, с контролем.docx</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/dc6/lni3a5lf41vw3yqm1aoyyemsbb2jaa82.xlsx">Работы по ремонту пожарного трубопровода АО КСК (2кв. 26).xlsx</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/377/rhskyh0p727tm4bh4exjb1osdqoe0i2m.pdf">схема1.pdf</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/283/rqcjay4qb94aj7vu63r8g8cbbarltrpm.pdf">ТЗ Модернизация пожарного водопровода АО КСК.pdf</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/dd1/gz5pqmweao1clwupf6ye978t6730tayt.docx">Приложение № 3 - Форма Акта ПП СП КСК (защищен.ред.).docx</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/ab3/14vgoru16l8e3wflc45365hh27zakvts.docx">Приложение №4 - О безопасности КСК (защищен.ред.).docx</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/f8e/qe5xlixt7m6wae2idk0qplgi6krr0s0v.docx">Закупочная документация.docx</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/8f2/xjo1tl88svxp204y88z29616alf7btr3.docx">Протокол подведения итогов.docx</a>
+</li>
+</ul>
+</div>
+</div>
+<div class="tenders__block tenders-block">
+<div class="tenders-block__wrap spoller__title">
+<div class="tenders-block__item">
+<div class="tenders-block__status">
+<div class="tenders-block__status-text">Действующая</div>
+<div class="tenders-block__status-num">№07</div>
+</div>
+</div>
+<div class="tenders-block__info">
+<div class="tenders-block__date">23.01.2023 08:34:00</div>
+<div class="tenders-block__text">Поставка роликов конических ленточного конвейера ЕВС42</div>
+<div class="tenders-block__row">
+<div class="tenders-block__row-item">
+<span> Подразделение:</span>
+                        Отдел механизации                    </div>
+<div class="tenders-block__row-item">
+<span>Способ закупки:</span>
+                        открытый запрос котировок цен                    </div>
+</div>
+</div>
+<button class="show-btn spoller">
+<span class="show-btn__text">Раскрыть</span>
+<span class="show-btn__icon"></span>
+</button>
+</div>
+<div class="tenders-block__hide spoller__text">
+<div class="tenders-block__row-item">
+<span> Стоимость закупки:</span>
+                2 737 920,00 руб., с НДС 20%            </div>
+<ul class="tenders-block__list">
+<li><a class="tenders-block__list-link" href="/upload/iblock/130/1v0sgyozrazj606zh14d6qqwos1diqg3.docx">ДОКУМЕНТАЦИЯ.docx</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/252/wmkwil37mdd4r58kdqljf8moslpvn0aq.doc">Ролик конический ленточного конвейера EBC42 (договор).doc</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/c5a/yqoebds8v6cl5vbevhem0tly1f5n3xy9.docx">Ролик конический ленточного конвейера EBC42 (ТЗ).docx</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/b65/xj9jdbl3n8zurs74gn694wf4e2mxacj1.PDF">БЛ-1 СБ Ролик конический.PDF</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/5d1/0qe0ozjigp5sy9dhlvvyh1po58x3j3d5.PDF">БЛ-1.002 Ось.PDF</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/9d4/9svqfe068ytuw7atcimmo1ugar4gfvb1.PDF">БЛ-1.003 Диск.PDF</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/599/fnpz698k1j53e4kuccy6sfm18t16vw7l.PDF">БЛ-1.004 Боковина.PDF</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/138/clmz7ke2f9r7x3ysabr3t4cq3sijopxg.PDF">БЛ-1.005 Кольцо.PDF</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/d78/3juffpnognbejg2eed2pke6tpbj26ryp.PDF">БЛ-1.006 Диск.PDF</a>
+</li>
+</ul>
+</div>
+</div>
+<div class="tenders__block tenders-block">
+<div class="tenders-block__wrap spoller__title">
+<div class="tenders-block__item">
+<div class="tenders-block__status">
+<div class="tenders-block__status-text"></div>
+<div class="tenders-block__status-num">№06</div>
+</div>
+</div>
+<div class="tenders-block__info">
+<div class="tenders-block__date">29.01.2018—12.02.2018</div>
+<div class="tenders-block__text">Оказание услуг по очистке аккумулирующего резервуара локальных очистных сооружений (ЛОС) и канализационной насосной станции дождевых вод (КНС) от образованного осадка</div>
+<div class="tenders-block__row">
+<div class="tenders-block__row-item">
+<span> Подразделение:</span>
+                        Экология                    </div>
+<div class="tenders-block__row-item">
+<span>Способ закупки:</span>
+                        открытый запрос котировок цен                    </div>
+</div>
+</div>
+<button class="show-btn spoller">
+<span class="show-btn__text">Раскрыть</span>
+<span class="show-btn__icon"></span>
+</button>
+</div>
+<div class="tenders-block__hide spoller__text">
+<div class="tenders-block__row-item">
+<span> Стоимость закупки:</span>
+                177 000,00 руб. с НДС 18%            </div>
+<ul class="tenders-block__list">
+<li><a class="tenders-block__list-link" href="/upload/iblock/613/61335ef5e9d9e9542cb59ea3d97f3725.doc">ДОКУМЕНТАЦИЯ.doc</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/d97/d977196bfd849521babe5beba68fd4f1.pdf">Паспорт отходов 1-4 классов опасности.pdf</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/edd/edd9ae23042a2c79822e3dbaac846df0.doc">Уведомление о внесении изменений от 31.01.2018.doc</a>
+</li>
+<li><a class="tenders-block__list-link" href="/upload/iblock/0f9/0f99835987f1199f1f4057b69661d127.docx">Уведомление об отказе в проведении процедуры.docx</a>
+</li>
+</ul>
+</div>
+</div>
+        </div>
+    </div>
 </div>
 </body></html>

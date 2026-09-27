@@ -264,10 +264,56 @@ class EuroChem(unittest.TestCase):
                          ["ЗАЧИСТКА РЕЗЕРВУАРОВ ХРАНЕНИЯ МАЗУТА КОТЕЛЬНОЙ"])
 
 
+class Ksk(unittest.TestCase):
+    """Настоящая вёрстка gt-ksk.com: весь архив закупок на одной странице, срок «01.09.2026 12:51:00—14.09.2026»."""
+    URL = "https://www.gt-ksk.com/about/tenders/"
+
+    def setUp(self):
+        self.items = tm.collect(source({"name": "КСК", "type": "html", "url": self.URL}),
+                                FakeHttp({self.URL: "ksk.html"}))
+
+    def test_blocks(self):
+        titles = [i.title for i in self.items]
+        self.assertEqual(len(self.items), 5)
+        self.assertEqual(titles[0], "Капитальный ремонт силосов зернохранилища общей вместимостью 110 000 тонн "
+                                    "(ремонт примыканий фундамента и стенки силосов)")
+        self.assertEqual(titles[1], titles[2])  # одна закупка объявлялась дважды
+        self.assertNotEqual(self.items[1].uid, self.items[2].uid)
+        self.assertFalse(any(t in ("Тендеры и закупки", "Безальтернативная закупка") for t in titles))
+        self.assertTrue(all(i.link == self.URL for i in self.items))  # файлы — не ссылки на закупку
+
+    def test_dates_and_price(self):
+        first, *_, single, old = self.items
+        self.assertTrue(first.published.startswith("2026-09-01"))
+        self.assertEqual(first.deadline, "14.09.2026")
+        self.assertTrue(single.published.startswith("2023-01-23"))  # срок без окончания
+        self.assertEqual(single.deadline, "")
+        self.assertTrue(old.published.startswith("2018-01-29"))
+        self.assertEqual(old.price, rub("177 000"))
+
+    def test_old_tenders_are_not_sent(self):
+        old = self.items[-1]
+        self.assertIn("очистке аккумулирующего резервуара", old.title)
+        self.assertEqual(wanted(self.items, LOOSE), [old.uid])  # по словам подходит
+        with patched(tm, "now_utc", lambda: tm.datetime(2026, 9, 27, tzinfo=tm.timezone.utc)):
+            self.assertEqual(wanted(self.items, SETTINGS), [])  # но ей 8 лет
+
+
 class GenericPage(unittest.TestCase):
+    def test_own_block_rules_in_config(self):
+        url = "https://example.ru/tenders/"
+        src = source({"name": "Сайт", "type": "html", "url": url,
+                      "item_block": "div.tender", "item_title": ".tender__title"})
+        items = tm.collect(src, FakeHttp({url: "generic_page.html"}))
+        self.assertEqual([i.title[:3] for i in items], ["№17", "№18", "№16"])
+        self.assertTrue(items[1].published.startswith("2026-09-25"))
+        self.assertEqual(items[1].deadline, "05.10.2026")
+        bad = source({"name": "Сайт", "type": "html", "url": url, "item_block": "div[", "item_title": "::"})
+        self.assertEqual((bad.item_block, bad.item_title), ("", ""))  # ошибка в селекторе — разбор без него
+
     def test_page_without_links(self):
-        url = "https://www.gt-ksk.com/about/tenders/"
-        items = tm.collect(source({"name": "КСК", "type": "html", "url": url}), FakeHttp({url: "ksk.html"}))
+        url = "https://example.ru/tenders/"
+        items = tm.collect(source({"name": "Сайт", "type": "html", "url": url}), FakeHttp({url: "generic_page.html"}))
         titles = [i.title for i in items]
         self.assertIn("№18 Зачистка резервуаров дизельного топлива на территории терминала", titles)
         self.assertEqual(len(items), 3)
@@ -449,7 +495,8 @@ class EdgeCases(unittest.TestCase):
             raise OSError("нет сети")
 
         http.session.get = boom
-        with patched(tm.ssl, "get_server_certificate", no_site):
+        with patched(tm.ssl, "get_server_certificate", no_site), \
+                patched(tm.Http, "_peer_certificate", lambda http, url: (None, "нет сети")):
             with self.assertRaises(tm.FetchError) as ctx:
                 http.get("https://aston.ru/tenders/current-purchases/")
         self.assertIn("--setup-cert", str(ctx.exception))
@@ -576,7 +623,7 @@ class MissingIntermediate(unittest.TestCase):
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
         self.enterContext(patched(tm, "ISSUERS_DIR", Path(self.dir.name) / "issuer_certs"))
-        self.enterContext(patched(tm.ssl, "get_server_certificate", lambda addr, timeout=None: self.site_pem))
+        self.enterContext(patched(tm.Http, "_peer_certificate", lambda http, url: (self.site, "")))
 
     def http(self, served: dict[str, bytes]):
         import requests
@@ -640,8 +687,7 @@ class MissingIntermediate(unittest.TestCase):
         self.assertEqual(http.calls, ["http://pki.test/int.crt", "http://pki.test/root.crt"])
 
     def test_no_issuer_link_is_explained(self):
-        self.enterContext(patched(tm.ssl, "get_server_certificate",
-                                  lambda addr, timeout=None: tm.ssl.DER_cert_to_PEM_cert(self.intermediate)))
+        self.enterContext(patched(tm.Http, "_peer_certificate", lambda http, url: (self.intermediate, "")))
         http2 = self.http({})
         with patched(tm, "system_roots", lambda: []):
             self.assertFalse(http2.fetch_missing_issuer("https://www.oteko.ru/"))
@@ -665,6 +711,35 @@ class MissingIntermediate(unittest.TestCase):
         self.assertIn("«Test Root CA», которого нет среди доверенных", error)
         src = source({"name": "Астон", "type": "html", "url": "https://aston.ru/tenders/"})
         self.assertIn("пришлите этот отчёт", tm.probe_hint(src, {}, error))
+
+    def test_downloaded_certificates_are_not_trust_anchors(self):
+        http = self.http({"http://pki.test/int.crt": self.intermediate})
+        self.assertTrue(http.fetch_missing_issuer("https://aston.ru/tenders/"))
+        http.verify_for("https://aston.ru/tenders/")
+        adapter = http.session.get_adapter("https://aston.ru/tenders/")
+        self.assertIsInstance(adapter, tm.HostTLSAdapter)
+        self.assertFalse(adapter._context.verify_flags & getattr(tm.ssl, "VERIFY_X509_PARTIAL_CHAIN", 0x80000))
+        self.assertNotIsInstance(http.session.get_adapter("https://aston.ru.example.com/"), tm.HostTLSAdapter)
+        self.assertIn("сайт показал сертификат «localhost», выданный «Test Intermediate CA»",
+                      http.issuer_notes["aston.ru"])
+
+    def test_proxy_is_named_without_password(self):
+        http = tm.Http({"settings": {"proxy": "http://user:secret@10.0.0.1:3128"}})
+        self.assertEqual(http._proxy_for("https://aston.ru/"), "http://10.0.0.1:3128")
+        self.assertIn("прокси: http://10.0.0.1:3128", tm.environment_line(http))
+
+    def test_socket_is_found_after_connection_close(self):
+        class Sock:
+            def getpeercert(self, binary_form=False):
+                return b"der"
+
+        class Obj:
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+
+        sock = Sock()
+        raw = Obj(connection=Obj(sock=None), _fp=Obj(fp=Obj(raw=Obj(_sock=sock))))
+        self.assertEqual(tm._response_sockets(raw), [sock])
 
     def test_get_retries_with_downloaded_intermediate(self):
         import requests

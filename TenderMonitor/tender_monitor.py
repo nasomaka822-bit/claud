@@ -38,6 +38,7 @@ import sqlite3
 import ssl
 import sys
 import time
+import warnings
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -62,7 +63,7 @@ except ModuleNotFoundError:
     print("Не хватает библиотек. Установите их командой:\n    pip install requests beautifulsoup4")
     sys.exit(1)
 
-VERSION = "1.3"
+VERSION = "1.4"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.toml"
 DB_PATH = BASE_DIR / "tender_monitor.db"
@@ -253,9 +254,12 @@ words = ["септик", "септич", "выгребн", "жбо", "бытов
 #                         например item_link = 'example\.ru/tenders/(\d+)';
 #   item_marker         — текст, который есть ровно один раз в каждом тендере на странице,
 #                         если у тендеров нет своих ссылок, например item_marker = "Прием заявок до";
+#   item_block, item_title — CSS-селекторы блока одного тендера и названия в нём, например
+#                         item_block = "div.tenders-block", item_title = ".tenders-block__text".
+#                         Срок вида «01.09.2026—14.09.2026» в блоке скрипт поймёт сам;
 #   require = [...]     — брать только тендеры, где есть одно из этих слов
 #                         (например, названия нужных дочерних обществ).
-# Для rostender.info, ahstep.ru, lukoil.ru и zakupki.eurochem.ru скрипт уже знает,
+# Для rostender.info, ahstep.ru, lukoil.ru, zakupki.eurochem.ru и gt-ksk.com скрипт уже знает,
 # как устроены страницы. Проверить все источники и посмотреть, что из них достаётся:
 #     python tender_monitor.py --probe
 # Выключить источник: enabled = false. Новый источник при первом чтении
@@ -447,6 +451,8 @@ pages = 25
 every_minutes = 120
 require = ["бму", "белореченск", "волгакалий", "волгасервис", "котельников"]
 
+# На странице КСК весь архив закупок с 2014 года; старые отсекает max_age_days
+# по дате начала закупки.
 [[sources]]
 name = "Зерновой терминал КСК (Новороссийск)"
 type = "html"
@@ -633,8 +639,13 @@ DEADLINE_RE = re.compile(
     r"(?i)(?:при[её]м\w*|подач\w*|окончани\w*)[^0-9]{0,40}?(\d{2}\.\d{2}\.\d{4}(?:\s+\d{1,2}:\d{2})?)"
 )
 PRICE_RE = re.compile(
-    r"(?i)(?:цена|нмц\w*|сумма)[^0-9]{0,30}(\d[\d  ]*(?:[.,]\d{1,2})?)\s*(?:руб|₽|р\.)"
+    r"(?i)(?:цена|нмц\w*|сумма|стоимост\w*)[^0-9]{0,30}(\d[\d  ]*(?:[.,]\d{1,2})?)\s*(?:руб|₽|р\.)"
 )
+# Срок закупки: «01.09.2026 12:51:00—14.09.2026» — начало (публикация) и окончание приёма заявок
+PERIOD_RE = re.compile(
+    r"(\d{2}\.\d{2}\.\d{4})(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?\s*[—–-]\s*(\d{2}\.\d{2}\.\d{4}(?:\s+\d{1,2}:\d{2})?)"
+)
+FIRST_DATE_RE = re.compile(r"\b(\d{2}\.\d{2}\.\d{4})\b")
 CUSTOMER_RE = re.compile(r"(?i)заказчик(?:\(и\))?\s*:\s*(.{3,160}?)(?=\s+(?:организатор|документы|при[её]м|окончани|начальн|цена|место)|$)")
 
 
@@ -689,6 +700,8 @@ class Source:
     every_minutes: int = 0    # проверять не чаще, чем раз в столько минут
     item_link: str = ""       # регулярное выражение для ссылок на карточки тендеров
     item_marker: str = ""     # текст, который есть один раз в каждом тендере на странице
+    item_block: str = ""      # CSS-селектор блока одного тендера
+    item_title: str = ""      # CSS-селектор названия внутри блока
     require: list[str] = field(default_factory=list)
 
     @property
@@ -762,6 +775,16 @@ def load_sources(cfg: dict) -> list[Source]:
                 except re.error as exc:
                     log.warning("Источник «%s»: ошибка в item_link (%s), разбираю страницу без него", name, exc)
                     src.item_link = ""
+            for option in ("item_block", "item_title"):
+                css = str(raw.get(option, "")).strip()
+                if css:
+                    try:
+                        BeautifulSoup("", "html.parser").select(css)
+                    except Exception as exc:  # soupsieve.SelectorSyntaxError
+                        log.warning("Источник «%s»: ошибка в %s (%s), разбираю страницу без него",
+                                    name, option, short_err(exc))
+                        css = ""
+                setattr(src, option, css)
             require = raw.get("require", [])
             src.require = [norm(str(w)) for w in (require if isinstance(require, list) else [require])
                            if str(w).strip()]
@@ -1005,6 +1028,37 @@ def system_roots() -> list[bytes]:
     return roots
 
 
+class HostTLSAdapter(requests.adapters.HTTPAdapter):
+    """Проверка сертификата сайта, которому докачаны сертификаты: только по его файлу сертификатов
+    и без «частичных цепочек». Python 3.13+ и urllib3 по умолчанию считают доверенным любой сертификат
+    из файла, даже промежуточный; скачанному по http промежуточному так доверять нельзя —
+    цепочка должна доходить до корневого."""
+
+    def __init__(self):
+        self._context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)  # сертификаты загрузит urllib3 из verify
+        self._context.verify_flags &= ~getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
+        super().__init__()
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs["ssl_context"] = self._context
+        return super().init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, proxy, **kwargs):
+        kwargs["ssl_context"] = self._context
+        return super().proxy_manager_for(proxy, **kwargs)
+
+
+def _response_sockets(raw) -> list:
+    """TLS-сокеты, через которые пришёл ответ urllib3. Соединение отдаёт сокет не всегда: при
+    «Connection: close» http.client отцепляет его от соединения и оставляет только в самом ответе."""
+    found = []
+    conn = getattr(raw, "connection", None) or getattr(raw, "_connection", None)
+    found.append(getattr(conn, "sock", None))
+    fp = getattr(getattr(raw, "_fp", None), "fp", None)  # http.client.HTTPResponse → BufferedReader
+    found.append(getattr(getattr(fp, "raw", None), "_sock", None))  # → SocketIO → сокет
+    return [s for s in found if s is not None and hasattr(s, "getpeercert")]
+
+
 def _host_file(host: str, suffix: str) -> Path:
     return ISSUERS_DIR / (re.sub(r"[^\w.-]", "_", host.lower()) + suffix)
 
@@ -1106,9 +1160,14 @@ class Http:
         return str(path)
 
     def verify_for(self, url: str):
-        host = urlparse(url).hostname or ""
+        parts = urlparse(url)
+        host = parts.hostname or ""
         own = self._host_bundle(host)
         if own:
+            if parts.scheme == "https":
+                prefix = f"https://{parts.netloc.rpartition('@')[2].lower()}/"
+                if prefix not in self.session.adapters:
+                    self.session.mount(prefix, HostTLSAdapter())
             return own
         return self.bundle if (self.bundle and is_ru_zone(host)) else True
 
@@ -1127,14 +1186,21 @@ class Http:
             log.info("%s: %s", host, note)
             return False
 
-        if self.session.proxies.get("https"):
-            return fail("при работе через прокси промежуточный сертификат не докачивается")
+        der, why = self._peer_certificate(url)
+        if der is None and not self._proxy_for(url):
+            try:  # запасной путь: прямое соединение
+                der = ssl.PEM_cert_to_DER_cert(ssl.get_server_certificate((host, parts.port or 443), timeout=15))
+            except (OSError, ValueError) as exc:
+                why = why or short_err(exc)
         try:
-            pem = ssl.get_server_certificate((host, parts.port or 443), timeout=15)
-            der = ssl.PEM_cert_to_DER_cert(pem)
-            cert_names(der)
-        except (OSError, ValueError) as exc:
-            return fail(f"не удалось прочитать сертификат сайта ({short_err(exc)})")
+            leaf_issuer = cert_names(der)[0] if der else None
+        except ValueError as exc:
+            leaf_issuer, why = None, short_err(exc)
+        if leaf_issuer is None:
+            return fail(f"не удалось прочитать сертификат сайта ({why or 'сайт его не прислал'})")
+        proxy = self._proxy_for(url)
+        seen = (f"сайт показал сертификат «{cert_cn(der)}», выданный «{name_cn(leaf_issuer)}»"
+                + (f", запросы идут через прокси {proxy}" if proxy else ""))
         extra = _host_file(host, ".crt")
         known = extra.read_text(encoding="ascii") if extra.is_file() else ""
         trusted = self._trusted_subjects(host)
@@ -1184,19 +1250,53 @@ class Http:
         added = [p for p in (ssl.DER_cert_to_PEM_cert(c) for c in chain) if p not in known]
         if not added:
             if root_note:
-                return fail(root_note)
+                return fail(f"{root_note}; {seen}")
             if known:
-                return fail("сохранённые ранее промежуточные сертификаты не помогли")
-            return fail("недостающих сертификатов не нашлось")
+                return fail(f"сохранённые ранее промежуточные сертификаты не помогли; {seen}")
+            return fail(f"недостающих сертификатов не нашлось; {seen}")
         ISSUERS_DIR.mkdir(exist_ok=True)
         extra.write_text(known + "".join(added), encoding="ascii")
         self.host_bundles.pop(host, None)
         names = ", ".join(f"«{cert_cn(ssl.PEM_cert_to_DER_cert(p))}»" for p in added)
         log.info("%s: добавлены сертификаты %s", host, names)
         # если и с ними не откроется, в ошибке будет видно, что докачка была
-        self.issuer_notes[host] = f"докачаны сертификаты {names}, но цепочка всё равно не сошлась" + (
-            f"; {root_note}" if root_note else "")
+        self.issuer_notes[host] = (f"докачаны сертификаты {names}, но цепочка всё равно не сошлась"
+                                   + (f"; {root_note}" if root_note else "") + f"; {seen}")
         return True
+
+    def _proxy_for(self, url: str) -> str:
+        """Прокси, через который requests пойдёт к сайту: из настроек или системный (Windows, переменные)."""
+        proxy = self.session.proxies.get("https", "")
+        if not proxy and self.session.trust_env:
+            proxy = requests.utils.get_environ_proxies(url).get("https", "")
+        return re.sub(r"//[^@/]*@", "//", proxy)  # без логина и пароля
+
+    def _peer_certificate(self, url: str) -> tuple[bytes | None, str]:
+        """Сертификат сайта таким, каким его видит requests (тем же путём, через тот же прокси).
+        Страница при этом не читается: нужен только сертификат, чтобы найти недостающий."""
+        probe = requests.Session()
+        probe.headers.update(self.session.headers)
+        probe.proxies.update(self.session.proxies)
+        probe.trust_env = self.session.trust_env
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")  # InsecureRequestWarning: проверку здесь выключаем намеренно
+                resp = probe.get(url, verify=False, stream=True, timeout=(15, 30), allow_redirects=False)
+        except requests.RequestException as exc:
+            probe.close()
+            return None, describe_request_error(exc)
+        try:
+            der = None
+            for sock in _response_sockets(resp.raw):
+                der = sock.getpeercert(binary_form=True)
+                if der:
+                    break
+        except (OSError, ValueError, AttributeError) as exc:
+            return None, short_err(exc)
+        finally:
+            resp.close()
+            probe.close()
+        return der, ""
 
     def _trusted_subjects(self, host: str) -> set[bytes]:
         """Владельцы сертификатов, которым скрипт уже доверяет для этого сайта."""
@@ -1508,12 +1608,16 @@ VOLATILE_RE = re.compile(
 #  - РосТендер: у каждого тендера ссылка /region/<регион>/<город>/<номер>-tender-…, 20 тендеров на странице;
 #  - «Степь»: ссылки /tenders/tender<номер>, название закупки — текст ссылки;
 #  - ЕвроХим: каждая закупка ведёт на свою карточку на b2b-center.ru;
-#  - ЛУКОЙЛ: у тендеров нет своих ссылок, но в каждом один раз написано «Прием заявок до».
+#  - ЛУКОЙЛ: у тендеров нет своих ссылок, но в каждом один раз написано «Прием заявок до»;
+#  - КСК: каждый тендер в блоке div.tenders-block, название в .tenders-block__text.
 HTML_PRESETS: dict[str, dict[str, str]] = {
     "rostender.info": {"item_link": r"rostender\.info/region/[a-z0-9-]+/(?:[a-z0-9-]+/)?(\d{6,})-tender"},
     "ahstep.ru": {"item_link": r"ahstep\.ru/tenders/tender(\d+)"},
     "zakupki.eurochem.ru": {"item_link": r"b2b-center\.ru/.*?tender-(\d+)"},
     "lukoil.ru": {"item_marker": "Прием заявок до"},
+    # КСК: весь архив закупок с 2014 года на одной странице, у закупки нет своей ссылки,
+    # срок написан как «01.09.2026 12:51:00—14.09.2026», статус «Действующая» не обновляется
+    "gt-ksk.com": {"item_block": "div.tenders-block", "item_title": ".tenders-block__text"},
 }
 # «АО Агрохолдинг «СТЕПЬ» объявляет о проведении запроса предложений на: «…»» → «…».
 # Двоеточие обязательно: иначе «…на выполнение работ по зачистке резервуаров на «Шесхарис»» стало бы «Шесхарис».
@@ -1539,15 +1643,20 @@ ROW_TAGS = ("li", "tr", "article")
 TOP_TAGS = ("body", "html", "[document]", "main")
 
 
-def html_rules(src: Source) -> tuple[str, str]:
-    """(item_link, item_marker) для источника: из config.toml или из встроенных правил для сайта."""
+HTML_RULES = ("item_link", "item_marker", "item_block", "item_title")
+
+
+def html_rules(src: Source) -> dict[str, str]:
+    """Как искать тендеры на странице: из config.toml, а если там не задано — встроенные правила для сайта."""
     host = (urlparse(src.url).hostname or "").lower()
     preset: dict[str, str] = {}
     for domain, rules in HTML_PRESETS.items():
         if host == domain or host.endswith("." + domain):
             preset = rules
             break
-    return src.item_link or preset.get("item_link", ""), src.item_marker or preset.get("item_marker", "")
+    own = {name: getattr(src, name) for name in HTML_RULES if getattr(src, name)}
+    # способ из config.toml заменяет встроенный целиком, чтобы не смешивать два способа
+    return own if (own.keys() - {"item_title"}) else {**preset, **own}
 
 
 def tidy_title(title: str) -> str:
@@ -1781,6 +1890,35 @@ def _marker_items(src: Source, soup, marker: str, host: str, hint: dict) -> list
     return items
 
 
+def _block_items(src: Source, soup, block_css: str, title_css: str, base: str, host: str) -> list[Item]:
+    """Каждый блок по CSS-селектору item_block — отдельный тендер, название — по item_title."""
+    items = []
+    for block in soup.select(block_css):
+        title_el = block.select_one(title_css) if title_css else None
+        title, full = _title_pair(title_el.get_text(" ", strip=True) if title_el else _block_title(block))
+        if len(title) < 5:
+            continue
+        context = clean(VOLATILE_RE.sub(" ", block.get_text(" ", strip=True)))[:2000]
+        period = PERIOD_RE.search(context)
+        first_date = period.group(1) if period else _first(FIRST_DATE_RE, context)
+        link = src.url
+        for a in block.find_all("a", href=True):
+            href = a["href"].strip()
+            if href and not href.startswith(("javascript:", "mailto:", "tel:", "#")) \
+                    and not FILE_HREF_RE.search(href):
+                link = safe_urljoin(base, href) or src.url
+                break
+        # номера закупок повторяются из года в год, названия тоже: различаем по названию и дате
+        ident = sha(norm(title) + "|" + first_date)
+        items.append(Item(
+            uid=f"html:{host}:{ident}", title=title[:400], link=link, source=src.name, text=full, context=context,
+            customer=_first(CUSTOMER_RE, context), price=format_price(_first(PRICE_RE, context)),
+            deadline=_first(DEADLINE_RE, context) or (clean(period.group(2)) if period else ""),
+            published=_iso(parse_date(first_date)),
+        ))
+    return items
+
+
 def _heading_block(heading, limit: int = 1500) -> str:
     parts = [heading.get_text(" ", strip=True)]
     node = heading
@@ -1883,11 +2021,13 @@ def items_from_html(src: Source, resp: requests.Response, hint: dict | None = No
     host = (urlparse(src.url).hostname or "").lower()
     base = resp.url or src.url
     hint = hint if hint is not None else {}
-    item_link, item_marker = html_rules(src)
-    if item_link:
-        return _link_items(src, soup, item_link, base, host, hint)
-    if item_marker:
-        return _marker_items(src, soup, item_marker, host, hint)
+    rules = html_rules(src)
+    if rules.get("item_block"):
+        return _block_items(src, soup, rules["item_block"], rules.get("item_title", ""), base, host)
+    if rules.get("item_link"):
+        return _link_items(src, soup, rules["item_link"], base, host, hint)
+    if rules.get("item_marker"):
+        return _marker_items(src, soup, rules["item_marker"], host, hint)
     return _generic_items(src, soup, base, host)
 
 
@@ -2695,6 +2835,19 @@ def save_probe_page(src: Source, html: str) -> str:
     return f"{PROBE_PAGES_DIR.name}/{name}.html"
 
 
+def environment_line(http) -> str:
+    """Версии Python и библиотек и системный прокси: по ним разбираются ошибки сертификатов."""
+    import platform
+    parts = [f"Python {platform.python_version()}", ssl.OPENSSL_VERSION, f"requests {requests.__version__}"]
+    for module in ("urllib3", "certifi"):
+        try:
+            parts.append(f"{module} {__import__(module).__version__}")
+        except (ImportError, AttributeError):
+            pass
+    proxy = http._proxy_for("https://zakupki.gov.ru/") if hasattr(http, "_proxy_for") else ""
+    return "Окружение: " + ", ".join(parts) + (f"; прокси: {proxy}" if proxy else "; прокси нет")
+
+
 def cmd_probe(cfg: dict, name_filter: str = "") -> int:
     """Проверка источников: из каждого достаёт тендеры и показывает, что получилось. Ничего не отправляет."""
     settings = cfg.get("settings", {})
@@ -2717,6 +2870,7 @@ def cmd_probe(cfg: dict, name_filter: str = "") -> int:
 
     out(f"Проверка источников {datetime.now(MSK).strftime('%d.%m.%Y %H:%M')} МСК, версия скрипта {VERSION}")
     out(f"Источников: {len(sources)}. Между запросами к одному сайту пауза, поэтому это займёт несколько минут.")
+    out(environment_line(http))
     ok = failed = empty = 0
     for src in sources:
         out()
