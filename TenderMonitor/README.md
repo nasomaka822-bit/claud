@@ -117,6 +117,46 @@ schtasks /Create /TN "TenderMonitor" /SC MINUTE /MO 30 /TR "\"C:\Users\Имя\Ap
 */30 * * * * cd /opt/tender_monitor && /usr/bin/python3 tender_monitor.py >> cron.log 2>&1
 ```
 
+## Raspberry Pi и управление из Telegram
+
+На Raspberry Pi скрипт работает как Telegram-бот: проверяет источники по расписанию (по умолчанию в 09:00 и 17:00 по Москве), после каждой проверки присылает короткий итог и слушает команды в вашем чате. Подходит Raspberry Pi OS 12 (Bookworm) и новее. Raspberry Pi должен быть в России: ЕИС открывается только с российских IP-адресов.
+
+1. Скопируйте папку со скриптом на Raspberry Pi, например в `/home/pi/TenderMonitor`. Возьмите `config.toml`, где уже вписаны `bot_token` и `chat_id`, и `tender_monitor.db`, чтобы не получать уже присланные тендеры заново.
+2. В терминале Raspberry Pi выполните:
+
+   ```
+   cd ~/TenderMonitor
+   bash install_pi.sh
+   ```
+
+   Скрипт установит библиотеки, скачает сертификат Минцифры и создаст службу `tender-monitor`. Служба запускается сама при включении Raspberry Pi и перезапускается после сбоя. Когда всё готово, бот пишет в чат «Бот мониторинга тендеров запущен».
+
+Команды в чате с ботом:
+
+| Команда | Что делает |
+|---|---|
+| `/check` | проверить источники сейчас; в конце придёт итог |
+| `/status` | расписание, последняя проверка, настройки, источники с ошибкой |
+| `/last` | 10 последних присланных тендеров |
+| `/time 09:00 17:00` | проверять в это время (московское); `/time сброс` — как в `config.toml` |
+| `/regions все` / `/regions юфо` | присылать тендеры по всей России или только ЮФО |
+| `/unspecified да` / `нет` | присылать ли тендеры, где вид нефтепродукта не указан |
+| `/phrase название` | проверить, пришёл бы тендер с таким названием |
+| `/pause` / `/resume` | остановить или возобновить проверки по расписанию |
+
+Бот отвечает только в чат, указанный в `chat_id`. Настройки, изменённые из чата, хранятся в `tender_monitor.db` и действуют поверх `config.toml`.
+
+Управлять службой на Raspberry Pi:
+
+```
+sudo systemctl status tender-monitor     # работает ли
+sudo systemctl restart tender-monitor    # перезапустить, например после правки config.toml
+sudo systemctl stop tender-monitor       # остановить
+tail -f ~/TenderMonitor/tender_monitor.log
+```
+
+Режим бота работает и на Windows: `python tender_monitor.py --bot`.
+
 ## Как настроить поиск
 
 Все настройки лежат в `config.toml` с комментариями. Файл перечитывается при каждой проверке.
@@ -167,6 +207,7 @@ schtasks /Create /TN "TenderMonitor" /SC MINUTE /MO 30 /TR "\"C:\Users\Имя\Ap
 - `tender_monitor.py`: сам скрипт.
 - `config.toml`: настройки.
 - `start_monitor.bat`: запуск постоянной проверки двойным щелчком (Windows).
+- `install_pi.sh`: установка на Raspberry Pi как служба с Telegram-ботом.
 - `probe_report.txt`: отчёт последней проверки источников (`--probe`).
 - `probe_pages/`: страницы сайтов компаний из последней проверки источников.
 - `issuer_certs/`: промежуточные сертификаты для сайтов, не отдающих их сами: `.crt` скрипт докачивает сам, `.cer` вы сохраняете из браузера.
@@ -180,6 +221,7 @@ schtasks /Create /TN "TenderMonitor" /SC MINUTE /MO 30 /TR "\"C:\Users\Имя\Ap
 |---|---|
 | `python tender_monitor.py` | одна проверка (для планировщика) |
 | `python tender_monitor.py --loop` | проверять постоянно |
+| `python tender_monitor.py --bot` | проверять по расписанию и слушать команды в Telegram |
 | `python tender_monitor.py --probe` | проверить каждый источник и сохранить отчёт |
 | `python tender_monitor.py --dry-run` | показать подходящие тендеры, ничего не отправляя |
 | `python tender_monitor.py --test` | отправить тестовое уведомление |

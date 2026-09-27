@@ -33,11 +33,13 @@ import logging.handlers
 import os
 import random
 import re
+import signal
 import smtplib
 import socket
 import sqlite3
 import ssl
 import sys
+import threading
 import time
 import warnings
 import xml.etree.ElementTree as ET
@@ -64,7 +66,7 @@ except ModuleNotFoundError:
     print("Не хватает библиотек. Установите их командой:\n    pip install requests beautifulsoup4")
     sys.exit(1)
 
-VERSION = "1.7"
+VERSION = "1.8"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.toml"
 DB_PATH = BASE_DIR / "tender_monitor.db"
@@ -101,6 +103,15 @@ DEFAULT_CONFIG = r'''# Настройки мониторинга тендеро�
 [settings]
 # Как часто проверять источники в режиме --loop, минут (не меньше 5).
 interval_minutes = 30
+
+# Во сколько проверять в режиме --bot (управление из Telegram), время московское.
+# Пустой список [] — проверять каждые interval_minutes минут.
+# Поменять из чата: /time 09:00 17:00
+check_times = ["09:00", "17:00"]
+
+# Режим --bot: после каждой проверки по расписанию присылать короткий итог,
+# даже если новых тендеров нет. false — писать только о тендерах и сбоях.
+report_each_check = true
 
 # true — присылать только тендеры из ваших регионов (списки ниже).
 # Тендеры, у которых регион определить не удалось, приходят всегда.
@@ -2265,6 +2276,7 @@ CREATE TABLE IF NOT EXISTS sources (
 CREATE TABLE IF NOT EXISTS sent (fingerprint TEXT PRIMARY KEY, uid TEXT, sent_at TEXT);
 CREATE INDEX IF NOT EXISTS sent_uid ON sent (uid);
 CREATE TABLE IF NOT EXISTS outbox (uid TEXT PRIMARY KEY, payload TEXT, created TEXT, attempts INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
 """
 
 
@@ -2355,6 +2367,24 @@ class Store:
             "INSERT OR IGNORE INTO outbox (uid, payload, created) VALUES (?,?,?)",
             (item.uid, json.dumps(asdict(item), ensure_ascii=False), now_utc().isoformat()),
         )
+
+    def kv_get(self, key: str, default=None):
+        """Настройки и состояние, заданные из чата Telegram (значения в JSON)."""
+        row = self.db.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return default
+        try:
+            return json.loads(row["value"])
+        except ValueError:
+            return default
+
+    def kv_set(self, key: str, value) -> None:
+        if value is None:
+            self.db.execute("DELETE FROM kv WHERE key = ?", (key,))
+        else:
+            self.db.execute("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)",
+                            (key, json.dumps(value, ensure_ascii=False)))
+        self.db.commit()
 
     def outbox(self) -> list[Item]:
         items = []
@@ -2639,7 +2669,8 @@ def evaluate(item: Item, matcher: Matcher, regions: RegionFilter, settings: dict
     return True
 
 
-def run_once(cfg: dict, *, dry_run: bool = False) -> int:
+def run_once(cfg: dict, *, dry_run: bool = False, report: dict | None = None) -> int:
+    """Одна проверка всех источников. В report (если передан) — итог для сообщения в чат."""
     settings = cfg.get("settings", {})
     label = str(settings.get("region_label", "ваш регион"))
     sources = [s for s in load_sources(cfg) if s.enabled]
@@ -2658,6 +2689,7 @@ def run_once(cfg: dict, *, dry_run: bool = False) -> int:
     added_sources: list[str] = []
     alerts: list[str] = []
     stats = {"ok": 0, "failed": 0, "fresh": 0, "later": 0}
+    failed_names: list[str] = []
     run_fps: set[str] = set()
 
     for src in sources:
@@ -2673,6 +2705,7 @@ def run_once(cfg: dict, *, dry_run: bool = False) -> int:
             error = short_err(exc) if isinstance(exc, FetchError) else f"{exc.__class__.__name__}: {short_err(exc)}"
             fails = store.source_fail(src, error)
             stats["failed"] += 1
+            failed_names.append(src.name)
             log.warning("× %s: %s", src.name, error)
             if state["last_ok"] and fails >= FAIL_ALERT_AFTER and not state["alerted"]:
                 alerts.append(f"Источник «{src.name}» не работает {fails} проверки подряд: {error}")
@@ -2748,6 +2781,9 @@ def run_once(cfg: dict, *, dry_run: bool = False) -> int:
 
     store.prune()
     store.commit()
+    if report is not None:
+        report.update(ok=stats["ok"], total=len(sources), failed=failed_names, later=stats["later"],
+                      new=len(new_items), digest=len(digest), first_run=first_run)
     later = f" (ещё {stats['later']} по расписанию позже)" if stats["later"] else ""
     log.info("Итого: источников %d/%d%s, новых записей %d, новых подходящих тендеров %d, ошибок %d",
              stats["ok"], len(sources), later, stats["fresh"], len(new_items), stats["failed"])
@@ -2806,6 +2842,21 @@ def setup_logging(verbose: bool) -> None:
         log.addHandler(console)
 
 
+def _pid_alive(pid: int) -> bool:
+    """Жив ли процесс, оставивший файл блокировки (после сбоя или перезагрузки его уже нет)."""
+    if pid <= 0 or pid == os.getpid():
+        return False
+    if os.name == "nt":
+        return True  # на Windows проверяем только возраст файла
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def acquire_lock(interval_minutes: int) -> bool:
     stale = max(90, interval_minutes * 2 + 10) * 60
     for _ in range(2):
@@ -2814,9 +2865,10 @@ def acquire_lock(interval_minutes: int) -> bool:
         except FileExistsError:
             try:
                 age = time.time() - LOCK_PATH.stat().st_mtime
-            except OSError:
-                age = stale + 1
-            if age < stale:
+                pid = int(LOCK_PATH.read_text().strip() or 0)
+            except (OSError, ValueError):
+                age, pid = stale + 1, 0
+            if age < stale and _pid_alive(pid):
                 return False
             LOCK_PATH.unlink(missing_ok=True)
             continue
@@ -3155,9 +3207,374 @@ def cmd_status() -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Управление из Telegram (режим --bot)
+# ---------------------------------------------------------------------------
+
+BOT_COMMANDS = [
+    ("check", "проверить источники сейчас"),
+    ("status", "состояние, расписание, настройки"),
+    ("last", "последние присланные тендеры"),
+    ("time", "расписание, например /time 09:00 17:00"),
+    ("regions", "регионы: /regions юфо или /regions все"),
+    ("unspecified", "тендеры без вида нефтепродукта: /unspecified да или нет"),
+    ("phrase", "проверить название: /phrase Зачистка резервуаров ДТ"),
+    ("pause", "остановить проверки по расписанию"),
+    ("resume", "возобновить проверки по расписанию"),
+    ("help", "список команд"),
+]
+TIME_RE = re.compile(r"^([01]?\d|2[0-3])[:.]([0-5]\d)$")
+
+
+def apply_overrides(cfg: dict, store: Store) -> dict:
+    """Настройки, изменённые из чата, поверх config.toml (сам файл не меняется)."""
+    cfg = dict(cfg)
+    settings = dict(cfg.get("settings", {}))
+    product = dict(cfg.get("product", {}))
+    for key in ("only_my_regions", "check_times"):
+        value = store.kv_get("set:" + key)
+        if value is not None:
+            settings[key] = value
+    value = store.kv_get("set:send_unspecified")
+    if value is not None:
+        product["send_unspecified"] = value
+    cfg["settings"], cfg["product"] = settings, product
+    return cfg
+
+
+def check_times(cfg: dict) -> list[str]:
+    times = []
+    for raw in cfg.get("settings", {}).get("check_times", []) or []:
+        m = TIME_RE.match(str(raw).strip())
+        if m:
+            times.append(f"{int(m.group(1)):02d}:{m.group(2)}")
+    return sorted(set(times))
+
+
+def latest_slot(times: list[str], now: datetime) -> datetime | None:
+    """Последнее время проверки по расписанию, которое уже наступило (московское время)."""
+    now = now.astimezone(MSK)
+    slots = []
+    for day in (now.date() - timedelta(days=1), now.date()):
+        for t in times:
+            h, m = map(int, t.split(":"))
+            slot = datetime(day.year, day.month, day.day, h, m, tzinfo=MSK)
+            if slot <= now:
+                slots.append(slot)
+    return max(slots) if slots else None
+
+
+def next_slot_text(cfg: dict, paused: bool) -> str:
+    if paused:
+        return "проверки по расписанию на паузе (/resume — возобновить)"
+    times = check_times(cfg)
+    if times:
+        return "проверки по расписанию в " + ", ".join(times) + " МСК"
+    interval = max(5, int(cfg.get("settings", {}).get("interval_minutes", 30)))
+    return f"проверки каждые {interval} мин"
+
+
+def report_text(report: dict, reason: str) -> str:
+    lines = [f"Проверка {reason} завершена: источников работает {report.get('ok', 0)} из {report.get('total', 0)}."]
+    if report.get("first_run"):
+        lines.append(f"Это первая проверка: найдено подходящих тендеров в лентах — {report.get('digest', 0)}, "
+                     "список пришёл выше. Дальше будут приходить только новые.")
+    elif report.get("new"):
+        lines.append(f"Новых подходящих тендеров: {report['new']}, они пришли выше.")
+    else:
+        lines.append("Новых подходящих тендеров нет.")
+    if report.get("failed"):
+        lines.append("Не ответили: " + ", ".join(report["failed"]) + ".")
+    if report.get("error"):
+        lines.append("Сбой проверки: " + report["error"])
+    return "\n".join(lines)
+
+
+class TelegramBot:
+    """Команды из чата: getUpdates с долгим ожиданием, отвечает только в чат из config.toml."""
+
+    def __init__(self, cfg: dict):
+        tg = cfg.get("telegram", {})
+        self.notifier = TelegramNotifier(tg)
+        self.chat_id = self.notifier.chat_id
+        self.offset = 0
+
+    def call(self, method: str, timeout: int = 30, **params):
+        try:
+            resp = self.notifier.session.post(f"{self.notifier.api}/bot{self.notifier.token}/{method}",
+                                              json=params, timeout=timeout + 15)
+            data = resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            log.warning("Telegram %s: %s", method, short_err(exc))
+            return None
+        if not data.get("ok"):
+            log.warning("Telegram %s: %s", method, data.get("description"))
+            return None
+        return data.get("result")
+
+    def say(self, text: str) -> bool:
+        return self.notifier._send(esc(text), text)
+
+    def updates(self, timeout: int) -> list[dict]:
+        result = self.call("getUpdates", timeout=timeout, offset=self.offset, allowed_updates=["message"])
+        if result is None:
+            time.sleep(5)
+            return []
+        if result:
+            self.offset = result[-1]["update_id"] + 1
+        return result
+
+
+class BotController:
+    def __init__(self, bot: TelegramBot):
+        self.bot = bot
+        self.store = Store(DB_PATH)
+        self.cfg: dict = {}
+        self.running = threading.Lock()  # одна проверка за раз
+
+    # --- проверка -----------------------------------------------------------------------------
+    def start_check(self, reason: str, *, tell: bool) -> bool:
+        if not self.running.acquire(blocking=False):
+            return False
+        cfg = self.cfg
+        threading.Thread(target=self._check, args=(cfg, reason, tell), daemon=True).start()
+        return True
+
+    def _check(self, cfg: dict, reason: str, tell: bool) -> None:
+        report: dict = {}
+        try:
+            run_once(cfg, report=report)
+        except Exception as exc:  # бот не должен падать из-за одной проверки
+            log.exception("Сбой проверки")
+            report["error"] = short_err(exc)
+        finally:
+            self.running.release()
+        store = Store(DB_PATH)  # своё соединение с базой: мы в другом потоке
+        store.kv_set("last_check", {"at": now_utc().isoformat(), "reason": reason, "report": report})
+        if tell or report.get("error") or cfg.get("settings", {}).get("report_each_check", True):
+            self.bot.say(report_text(report, reason))
+
+    def due(self) -> bool:
+        if self.store.kv_get("paused", False):
+            return False
+        last = self.store.kv_get("last_check")
+        if not last:
+            return True  # первый запуск: сразу проверить
+        times = check_times(self.cfg)
+        now = now_utc()
+        last_at = datetime.fromisoformat(last["at"])
+        if not times:
+            interval = max(5, int(self.cfg.get("settings", {}).get("interval_minutes", 30)))
+            return now - last_at >= timedelta(minutes=interval)
+        slot = latest_slot(times, now)
+        return slot is not None and last_at < slot
+
+    # --- команды ------------------------------------------------------------------------------
+    def handle(self, message: dict) -> None:
+        chat = str((message.get("chat") or {}).get("id", ""))
+        text = (message.get("text") or "").strip()
+        if not text.startswith("/"):
+            return
+        if chat != self.bot.chat_id:
+            log.warning("Команда из чужого чата %s отклонена", chat)
+            return
+        command, _, args = text.partition(" ")
+        command = command[1:].split("@")[0].lower()
+        args = args.strip()
+        handler = getattr(self, "cmd_" + command, None)
+        if handler is None:
+            self.bot.say("Не знаю такой команды. Список: /help")
+            return
+        try:
+            handler(args)
+        except Exception as exc:
+            log.exception("Команда /%s", command)
+            self.bot.say(f"Не получилось выполнить /{command}: {short_err(exc)}")
+
+    def cmd_start(self, args: str) -> None:
+        self.cmd_help(args)
+
+    def cmd_help(self, args: str) -> None:
+        self.bot.say("Команды:\n" + "\n".join(f"/{name} — {text}" for name, text in BOT_COMMANDS)
+                     + "\n\nСейчас " + next_slot_text(self.cfg, self.store.kv_get("paused", False)) + ".")
+
+    def cmd_check(self, args: str) -> None:
+        if self.start_check("по команде", tell=True):
+            self.bot.say("Начинаю проверку, это займёт несколько минут. Новые тендеры придут отдельно, "
+                         "в конце пришлю итог.")
+        else:
+            self.bot.say("Проверка уже идёт, итог пришлю, когда она закончится.")
+
+    def cmd_status(self, args: str) -> None:
+        settings = self.cfg.get("settings", {})
+        product = self.cfg.get("product", {})
+        lines = ["Сейчас " + next_slot_text(self.cfg, self.store.kv_get("paused", False)) + "."]
+        if self.running.locked():
+            lines.append("Идёт проверка.")
+        last = self.store.kv_get("last_check")
+        if last:
+            at = datetime.fromisoformat(last["at"]).astimezone(MSK).strftime("%d.%m %H:%M")
+            lines.append(f"Последняя проверка {last['reason']}: {at} МСК.")
+            lines.append(report_text(last.get("report", {}), last["reason"]).split("\n", 1)[-1])
+        regions = "только " + str(settings.get("region_label", "ваш регион")) + " и без региона" \
+            if settings.get("only_my_regions", True) else "вся Россия"
+        lines.append(f"Регионы: {regions} (/regions).")
+        if product.get("enabled"):
+            lines.append("Тендеры без вида нефтепродукта: " + ("присылаются с пометкой" if product.get(
+                "send_unspecified", True) else "не присылаются") + " (/unspecified).")
+        failing = self.store.db.execute(
+            "SELECT name, last_error FROM sources WHERE fail_count > 0 ORDER BY name").fetchall()
+        if failing:
+            lines.append("Источники с ошибкой: " + "; ".join(f"{r['name']} — {r['last_error']}" for r in failing))
+        sent = self.store.db.execute("SELECT COUNT(*) FROM sent").fetchone()[0]
+        lines.append(f"Всего прислано тендеров: {sent}.")
+        self.bot.say("\n".join(lines))
+
+    def cmd_last(self, args: str) -> None:
+        rows = self.store.db.execute(
+            "SELECT sent.sent_at, seen.title, seen.link, seen.source FROM sent JOIN seen ON seen.uid = sent.uid "
+            "ORDER BY sent.sent_at DESC LIMIT 10").fetchall()
+        if not rows:
+            self.bot.say("Тендеров ещё не присылал.")
+            return
+        parts = ["<b>Последние присланные тендеры</b>"]
+        for r in rows:
+            at = datetime.fromisoformat(r["sent_at"]).astimezone(MSK).strftime("%d.%m")
+            title = esc(truncate(r["title"] or "", 150))
+            link = f'<a href="{esc_attr(r["link"])}">{title}</a>' if (r["link"] or "").startswith("http") else title
+            parts.append(f"{at} · {link} · {esc(r['source'] or '')}")
+        self.bot.notifier._send("\n\n".join(parts))
+
+    def cmd_time(self, args: str) -> None:
+        if not args:
+            self.bot.say("Сейчас " + next_slot_text(self.cfg, False) + ". Поменять: /time 09:00 17:00. "
+                         "Вернуть как в config.toml: /time сброс")
+            return
+        if args.lower() in ("сброс", "reset"):
+            self.store.kv_set("set:check_times", None)
+        else:
+            times = [t for t in re.split(r"[\s,;]+", args) if t]
+            bad = [t for t in times if not TIME_RE.match(t)]
+            if bad or not times:
+                self.bot.say("Не понял время: " + ", ".join(bad or [args]) + ". Пример: /time 09:00 17:00")
+                return
+            self.store.kv_set("set:check_times", times)
+        self.cfg = apply_overrides(self.base_cfg, self.store)
+        self.bot.say("Готово: " + next_slot_text(self.cfg, self.store.kv_get("paused", False)) + ".")
+
+    def cmd_regions(self, args: str) -> None:
+        value = args.lower()
+        if value in ("все", "всё", "all", "россия"):
+            self.store.kv_set("set:only_my_regions", False)
+        elif value:
+            self.store.kv_set("set:only_my_regions", True)
+        self.cfg = apply_overrides(self.base_cfg, self.store)
+        label = self.cfg.get("settings", {}).get("region_label", "ваш регион")
+        mode = self.cfg.get("settings", {}).get("only_my_regions", True)
+        self.bot.say((f"Присылаю тендеры: {label} и без региона." if mode else "Присылаю тендеры по всей России.")
+                     + " Переключить: /regions все или /regions юфо")
+
+    def cmd_unspecified(self, args: str) -> None:
+        value = args.lower()
+        if value in ("да", "yes", "on", "вкл"):
+            self.store.kv_set("set:send_unspecified", True)
+        elif value in ("нет", "no", "off", "выкл"):
+            self.store.kv_set("set:send_unspecified", False)
+        self.cfg = apply_overrides(self.base_cfg, self.store)
+        on = self.cfg.get("product", {}).get("send_unspecified", True)
+        self.bot.say(("Тендеры, где вид нефтепродукта не указан, присылаю с пометкой." if on else
+                      "Тендеры, где вид нефтепродукта не указан, не присылаю.")
+                     + " Переключить: /unspecified да или /unspecified нет")
+
+    def cmd_phrase(self, args: str) -> None:
+        if not args:
+            self.bot.say("Напишите название после команды: /phrase Зачистка резервуаров ДТ на АЗС")
+            return
+        matcher = Matcher(self.cfg)
+        rules = matcher.match([args])
+        excluded = matcher.excluded_by([norm(args)])
+        lines = []
+        if excluded:
+            lines.append(f"Не подходит: слово-исключение «{excluded}».")
+        elif rules:
+            lines.append("Подходит по правилам: " + ", ".join(rules) + ".")
+            kind, word = matcher.product_kind([args])
+            if kind == "light":
+                lines.append(f"Нефтепродукт светлый («{word}») — пришлю.")
+            elif kind == "dark":
+                lines.append(f"Нефтепродукт не светлый («{word}») — не пришлю.")
+            elif kind == "unspecified":
+                lines.append("Вид нефтепродукта не указан — " + (
+                    "пришлю с пометкой." if matcher.send_unspecified else "не пришлю."))
+        else:
+            lines.append("Не подходит: ни одно правило не сработало.")
+        region = RegionFilter(self.cfg.get("settings", {})).classify(Item(uid="phrase", title=args, link=""))
+        lines.append("Регион: " + (str(self.cfg["settings"].get("region_label", "ваш")) if region == "my"
+                                   else "в тексте не найден (такие приходят)"))
+        self.bot.say("\n".join(lines))
+
+    def cmd_pause(self, args: str) -> None:
+        self.store.kv_set("paused", True)
+        self.bot.say("Проверки по расписанию на паузе. /check — проверить вручную, /resume — возобновить.")
+
+    def cmd_resume(self, args: str) -> None:
+        self.store.kv_set("paused", None)
+        self.bot.say("Проверки возобновлены: " + next_slot_text(self.cfg, False) + ".")
+
+    # --- главный цикл --------------------------------------------------------------------------
+    def run(self, cfg: dict) -> int:
+        self.base_cfg = cfg
+        self.cfg = apply_overrides(cfg, self.store)
+        self.bot.call("setMyCommands", commands=[{"command": c, "description": d} for c, d in BOT_COMMANDS])
+        # сообщения, пришедшие, пока бот был выключен, не выполняем: это могли быть старые /check
+        stale = self.bot.call("getUpdates", timeout=0, offset=-1)
+        if stale:
+            self.bot.offset = stale[-1]["update_id"] + 1
+        self.bot.say("Бот мониторинга тендеров запущен: " + next_slot_text(self.cfg, self.store.kv_get("paused", False))
+                     + ". Команды — /help")
+        log.info("Режим бота: %s", next_slot_text(self.cfg, False))
+        while True:
+            try:
+                try:
+                    self.base_cfg = load_config()
+                except ConfigError as exc:
+                    log.error("%s\nПродолжаю с прежними настройками.", exc)
+                self.cfg = apply_overrides(self.base_cfg, self.store)
+                if self.due():
+                    self.start_check("по расписанию", tell=False)
+                for update in self.bot.updates(timeout=25):
+                    if update.get("message"):
+                        self.handle(update["message"])
+                os.utime(LOCK_PATH)
+            except KeyboardInterrupt:
+                break
+            except Exception:
+                log.exception("Сбой в режиме бота, продолжаю")
+                time.sleep(10)
+        log.info("Бот остановлен")
+        return 0
+
+
+def cmd_bot(cfg: dict) -> int:
+    tg = cfg.get("telegram", {})
+    if not str(tg.get("bot_token", "")).strip() or not str(tg.get("chat_id", "")).strip():
+        print("Для режима бота впишите bot_token и chat_id в раздел [telegram] файла config.toml "
+              "(chat_id найдёт команда: python tender_monitor.py --get-chat-id).")
+        return 2
+    if not acquire_lock(60):
+        log.warning("Мониторинг уже запущен (файл %s). Если это не так, удалите этот файл.", LOCK_PATH.name)
+        return 1
+    if hasattr(signal, "SIGTERM"):
+        # systemctl stop присылает SIGTERM: выходим как по Ctrl+C, чтобы убрать файл блокировки
+        signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    return BotController(TelegramBot(cfg)).run(cfg)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Мониторинг тендеров на зачистку резервуаров")
     parser.add_argument("--loop", action="store_true", help="проверять постоянно с интервалом из config.toml")
+    parser.add_argument("--bot", action="store_true",
+                        help="проверять по расписанию check_times и слушать команды в чате Telegram")
     parser.add_argument("--test", action="store_true", help="отправить тестовое уведомление")
     parser.add_argument("--get-chat-id", action="store_true", help="узнать chat_id для Telegram")
     parser.add_argument("--setup-cert", action="store_true", help="скачать сертификат Минцифры для ЕИС")
@@ -3189,6 +3606,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_probe(cfg, args.probe)
     if args.dry_run:
         return run_once(cfg, dry_run=True)
+    if args.bot:
+        return cmd_bot(cfg)
 
     interval = max(5, int(cfg.get("settings", {}).get("interval_minutes", 30)))
     if not acquire_lock(interval):

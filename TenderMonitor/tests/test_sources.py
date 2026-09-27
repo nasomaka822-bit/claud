@@ -17,6 +17,7 @@ import contextlib
 import io
 import sys
 import tempfile
+import time
 import unittest
 from datetime import timedelta
 from pathlib import Path
@@ -879,6 +880,95 @@ class MissingIntermediate(unittest.TestCase):
             http.get("https://aston.example/tenders/")
         self.assertEqual(attempts, [False, True])  # повтор — уже с докачанным сертификатом
         self.assertIn(self.intermediate, self.loaded(http, "https://aston.example/tenders/"))
+
+
+class FakeBot:
+    """Вместо Telegram: запоминает, что бот написал в чат."""
+    chat_id = "42"
+
+    def __init__(self):
+        self.said: list[str] = []
+        self.notifier = self
+
+    def say(self, text):
+        self.said.append(text)
+        return True
+
+    def _send(self, text_html, text_plain=None):
+        self.said.append(text_html)
+        return True
+
+
+class Bot(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.enterContext(patched(tm, "DB_PATH", Path(tmp.name) / "t.db"))
+        self.bot = FakeBot()
+        self.ctl = tm.BotController(self.bot)
+        self.ctl.base_cfg = CFG
+        self.ctl.cfg = tm.apply_overrides(CFG, self.ctl.store)
+
+    def send(self, text, chat="42"):
+        self.bot.said.clear()
+        self.ctl.handle({"chat": {"id": int(chat)}, "text": text})
+        return "\n".join(self.bot.said)
+
+    def test_only_own_chat(self):
+        self.assertEqual(self.send("/status", chat="777"), "")
+        self.assertIn("Команды", self.send("/help"))
+        self.assertIn("Не знаю такой команды", self.send("/abc"))
+        self.assertIn("Команды", self.send("/help@TenderBot"))
+
+    def test_settings_from_chat(self):
+        self.assertIn("по всей России", self.send("/regions все"))
+        self.assertFalse(self.ctl.cfg["settings"]["only_my_regions"])
+        self.assertIn("ЮФО и без региона", self.send("/regions юфо"))
+        self.assertIn("не присылаю", self.send("/unspecified нет"))
+        self.assertFalse(tm.Matcher(self.ctl.cfg).send_unspecified)
+        self.assertIn("08:30, 18:00", self.send("/time 18:00 8:30"))
+        self.assertEqual(tm.check_times(self.ctl.cfg), ["08:30", "18:00"])
+        self.assertIn("Не понял время", self.send("/time 25:00"))
+        self.assertIn("09:00, 17:00", self.send("/time сброс"))
+        self.assertIn("на паузе", self.send("/pause"))
+        self.assertFalse(self.ctl.due())
+        self.send("/resume")
+        self.assertTrue(self.ctl.due())  # проверок ещё не было
+
+    def test_phrase(self):
+        self.assertIn("светлый («дт»)", self.send("/phrase Зачистка резервуаров ДТ на нефтебазе"))
+        self.assertIn("не пришлю", self.send("/phrase Зачистка резервуаров мазута"))
+
+    def test_schedule(self):
+        msk = tm.MSK
+        times = ["09:00", "17:00"]
+        at = tm.datetime(2026, 9, 28, 12, 0, tzinfo=msk)
+        self.assertEqual(tm.latest_slot(times, at), tm.datetime(2026, 9, 28, 9, 0, tzinfo=msk))
+        self.assertEqual(tm.latest_slot(times, tm.datetime(2026, 9, 28, 8, 0, tzinfo=msk)),
+                         tm.datetime(2026, 9, 27, 17, 0, tzinfo=msk))
+        self.ctl.store.kv_set("last_check", {"at": tm.datetime(2026, 9, 28, 9, 5, tzinfo=msk).isoformat(),
+                                             "reason": "по расписанию", "report": {}})
+        with patched(tm, "now_utc", lambda: at):
+            self.assertFalse(self.ctl.due())  # в 09:00 уже проверяли
+        with patched(tm, "now_utc", lambda: tm.datetime(2026, 9, 28, 17, 1, tzinfo=msk)):
+            self.assertTrue(self.ctl.due())
+
+    def test_check_reports_to_chat(self):
+        def fake_run(cfg, report=None, **kw):
+            report.update(ok=28, total=31, failed=["НМТП"], new=0, digest=0, first_run=False)
+            return 0
+
+        with patched(tm, "run_once", fake_run):
+            self.assertIn("Начинаю проверку", self.send("/check"))
+            for _ in range(100):
+                if not self.ctl.running.locked() and len(self.bot.said) > 1:
+                    break
+                time.sleep(0.02)
+        summary = self.bot.said[-1]
+        self.assertIn("работает 28 из 31", summary)
+        self.assertIn("Новых подходящих тендеров нет", summary)
+        self.assertIn("Не ответили: НМТП", summary)
+        self.assertIn("Последняя проверка по команде", self.send("/status"))
 
 
 if __name__ == "__main__":
