@@ -623,6 +623,49 @@ class MissingIntermediate(unittest.TestCase):
         self.assertFalse(http.fetch_missing_issuer("https://aston.ru/tenders/"))
         self.assertFalse(tm.ISSUERS_DIR.exists())
 
+    def test_untrusted_root_is_named(self):
+        http = self.http({"http://pki.test/int.crt": self.intermediate, "http://pki.test/root.crt": self.root})
+        with patched(tm, "system_roots", lambda: []):
+            self.assertTrue(http.fetch_missing_issuer("https://aston.ru/tenders/"))
+        note = http.issuer_notes["aston.ru"]
+        self.assertIn("«Test Intermediate CA»", note)
+        self.assertIn("корневому «Test Root CA», которого нет среди доверенных", note)
+
+    def test_root_from_windows_store(self):
+        http = self.http({"http://pki.test/int.crt": self.intermediate})  # корневой по ссылке не отдаётся
+        with patched(tm, "system_roots", lambda: [self.root]):
+            self.assertTrue(http.fetch_missing_issuer("https://aston.ru/tenders/"))
+        saved = (tm.ISSUERS_DIR / "aston.ru.crt").read_text(encoding="ascii")
+        self.assertEqual(saved.count("BEGIN CERTIFICATE"), 2)
+        self.assertEqual(http.calls, ["http://pki.test/int.crt", "http://pki.test/root.crt"])
+
+    def test_no_issuer_link_is_explained(self):
+        self.enterContext(patched(tm.ssl, "get_server_certificate",
+                                  lambda addr, timeout=None: tm.ssl.DER_cert_to_PEM_cert(self.intermediate)))
+        http2 = self.http({})
+        with patched(tm, "system_roots", lambda: []):
+            self.assertFalse(http2.fetch_missing_issuer("https://www.oteko.ru/"))
+        self.assertIn("не удалось скачать сертификат издателя: http://pki.test/root.crt: HTTP 404",
+                      http2.issuer_notes["www.oteko.ru"])
+
+    def test_error_text_contains_the_reason(self):
+        import requests
+        http = self.http({"http://pki.test/int.crt": self.intermediate, "http://pki.test/root.crt": self.root})
+
+        def get(url, **kwargs):
+            raise requests.exceptions.SSLError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+                                               "unable to get local issuer certificate (_ssl.c:1081)")
+
+        fetch_get = http.session.get
+        http.session.get = lambda url, **kw: fetch_get(url, **kw) if "pki.test" in url else get(url, **kw)
+        with patched(tm, "system_roots", lambda: []), patched(tm.time, "sleep", lambda s: None):
+            with self.assertRaises(tm.FetchError) as ctx:
+                http.get("https://aston.ru/tenders/")
+        error = str(ctx.exception)
+        self.assertIn("«Test Root CA», которого нет среди доверенных", error)
+        src = source({"name": "Астон", "type": "html", "url": "https://aston.ru/tenders/"})
+        self.assertIn("пришлите этот отчёт", tm.probe_hint(src, {}, error))
+
     def test_get_retries_with_downloaded_intermediate(self):
         import requests
         http = self.http({"http://pki.test/int.crt": self.intermediate})

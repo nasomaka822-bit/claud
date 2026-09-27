@@ -62,7 +62,7 @@ except ModuleNotFoundError:
     print("Не хватает библиотек. Установите их командой:\n    pip install requests beautifulsoup4")
     sys.exit(1)
 
-VERSION = "1.2"
+VERSION = "1.3"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.toml"
 DB_PATH = BASE_DIR / "tender_monitor.db"
@@ -400,13 +400,14 @@ page_size = 10
 pages = 200
 every_minutes = 240
 
-# «Степь» тоже сортирует по сроку подачи. В сентябре 2026 открытые закупки
-# перестали помещаться на 2 страницы; скрипт остановится сам, когда пойдут повторы.
+# «Степь» тоже сортирует по сроку подачи, а без фильтра показывает и завершённые
+# закупки (150 и больше на 5 страницах). status=1 — только «Идёт приём предложений».
+# Скрипт остановится сам, когда пойдут повторы.
 [[sources]]
 name = "Агрохолдинг «Степь»"
 type = "html"
-url = "https://www.ahstep.ru/tender"
-page_url = "https://www.ahstep.ru/tender?page={page}"
+url = "https://www.ahstep.ru/tender?status=1"
+page_url = "https://www.ahstep.ru/tender?status=1&page={page}"
 pages = 5
 every_minutes = 60
 
@@ -442,8 +443,8 @@ name = "ЕвроХим: БМУ и ВолгаКалий"
 type = "html"
 url = "https://zakupki.eurochem.ru/aktualnye-zakupki1"
 page_url = "https://zakupki.eurochem.ru/aktualnye-zakupki1?cat_page={page}"
-pages = 8
-every_minutes = 60
+pages = 25
+every_minutes = 120
 require = ["бму", "белореченск", "волгакалий", "волгасервис", "котельников"]
 
 [[sources]]
@@ -967,6 +968,43 @@ def cert_der(content: bytes) -> bytes | None:
         return None
 
 
+def name_cn(name: bytes) -> str:
+    """Общее имя (CN) из имени X.509 в виде DER; если его нет — «?»."""
+    i = name.find(b"\x06\x03\x55\x04\x03")  # OID 2.5.4.3 commonName
+    if i == -1:
+        return "?"
+    try:
+        tag, a, b = _der_element(name, i + 5)
+    except (ValueError, IndexError):
+        return "?"
+    raw = name[a:b]
+    if tag == 0x1E:  # BMPString
+        return raw.decode("utf-16-be", errors="replace")
+    return raw.decode("utf-8", errors="replace")
+
+
+def cert_cn(der: bytes) -> str:
+    try:
+        return name_cn(cert_names(der)[1])
+    except ValueError:
+        return "?"
+
+
+def system_roots() -> list[bytes]:
+    """Корневые сертификаты из хранилища Windows. На других системах — пусто:
+    там Python и так берёт сертификаты системы или certifi."""
+    if not hasattr(ssl, "enum_certificates"):
+        return []
+    roots = []
+    try:
+        for der, encoding, trust in ssl.enum_certificates("ROOT"):
+            if encoding == "x509_asn" and (trust is True or "1.3.6.1.5.5.7.3.1" in trust):  # serverAuth
+                roots.append(der)
+    except OSError:
+        pass
+    return roots
+
+
 def _host_file(host: str, suffix: str) -> Path:
     return ISSUERS_DIR / (re.sub(r"[^\w.-]", "_", host.lower()) + suffix)
 
@@ -1042,6 +1080,7 @@ class Http:
         self.down: dict[str, str] = {}  # сайты, которые не ответили в эту проверку
         self.host_bundles: dict[str, str] = {}
         self.issuer_tried: set[str] = set()
+        self.issuer_notes: dict[str, str] = {}
 
     def _base_bundle(self, host: str) -> str:
         if self.bundle and is_ru_zone(host):
@@ -1074,52 +1113,121 @@ class Http:
         return self.bundle if (self.bundle and is_ru_zone(host)) else True
 
     def fetch_missing_issuer(self, url: str) -> bool:
-        """Докачивает промежуточные сертификаты сайта. True — есть новые, запрос стоит повторить."""
+        """Достраивает цепочку сертификатов сайта. True — добавлено новое, запрос стоит повторить.
+
+        Почему не получилось, записывается в self.issuer_notes[host] для текста ошибки и --probe."""
         parts = urlparse(url)
         host = parts.hostname or ""
         if not host or host in self.issuer_tried:
             return False
         self.issuer_tried.add(host)
-        if self.session.proxies.get("https"):
-            log.info("%s: промежуточный сертификат не докачивается при работе через прокси", host)
+
+        def fail(note: str) -> bool:
+            self.issuer_notes[host] = note
+            log.info("%s: %s", host, note)
             return False
+
+        if self.session.proxies.get("https"):
+            return fail("при работе через прокси промежуточный сертификат не докачивается")
         try:
             pem = ssl.get_server_certificate((host, parts.port or 443), timeout=15)
             der = ssl.PEM_cert_to_DER_cert(pem)
+            cert_names(der)
         except (OSError, ValueError) as exc:
-            log.info("%s: не удалось прочитать сертификат сайта (%s)", host, short_err(exc))
-            return False
+            return fail(f"не удалось прочитать сертификат сайта ({short_err(exc)})")
         extra = _host_file(host, ".crt")
         known = extra.read_text(encoding="ascii") if extra.is_file() else ""
-        added = []
-        for _ in range(3):  # сайт → промежуточный → ещё один промежуточный
+        trusted = self._trusted_subjects(host)
+        chain: list[bytes] = []  # промежуточные сверху вниз
+        root_note = ""
+        for _ in range(4):  # сайт → промежуточный → ещё один промежуточный → корневой
+            issuer_name = cert_names(der)[0]
+            if issuer_name in trusted:
+                break  # издатель уже в доверенных, дальше идти не нужно
+            urls = ca_issuer_urls(der)
             issuer_der = None
-            for issuer_url in ca_issuer_urls(der):
+            errors = []
+            for issuer_url in urls:
                 try:
                     resp = self.session.get(issuer_url, timeout=(10, 20))
                 except requests.RequestException as exc:
-                    log.info("%s: %s не скачался (%s)", host, issuer_url, describe_request_error(exc))
+                    errors.append(f"{issuer_url}: {describe_request_error(exc)}")
                     continue
-                if resp.status_code == 200:
-                    issuer_der = cert_der(resp.content)
-                    if issuer_der:
-                        break
+                issuer_der = cert_der(resp.content) if resp.status_code == 200 else None
+                if issuer_der:
+                    break
+                errors.append(f"{issuer_url}: " + (describe_status(resp.status_code) if resp.status_code != 200
+                                                   else "ответ не похож на сертификат"))
             if not issuer_der:
+                issuer_der = self._system_root(issuer_name)  # Windows может знать корневой, которого нет в Python
+                if issuer_der:
+                    chain.append(issuer_der)
+                    log.info("%s: корневой «%s» взят из хранилища сертификатов Windows", host, cert_cn(issuer_der))
+                elif not urls:
+                    root_note = f"в сертификате «{cert_cn(der)}» нет ссылки на сертификат издателя «{name_cn(issuer_name)}»"
+                else:
+                    root_note = "не удалось скачать сертификат издателя: " + "; ".join(errors)
                 break
             issuer, subject = cert_names(issuer_der)
             if issuer == subject:
-                break  # дошли до корневого: ему доверяем, только если он уже есть в системе
-            pem = ssl.DER_cert_to_PEM_cert(issuer_der)
-            if pem not in known:
-                added.append(pem)
-                log.info("%s: докачан промежуточный сертификат с %s", host, issuer_url)
+                # корневой, скачанный из интернета, не принимаем: доверяем только тому, что уже есть в системе
+                system = self._system_root(subject)
+                if system:
+                    chain.append(system)
+                    log.info("%s: корневой «%s» взят из хранилища сертификатов Windows", host, cert_cn(system))
+                else:
+                    root_note = (f"цепочка сертификатов ведёт к корневому «{cert_cn(issuer_der)}», "
+                                 f"которого нет среди доверенных")
+                break
+            chain.append(issuer_der)
             der = issuer_der
+        added = [p for p in (ssl.DER_cert_to_PEM_cert(c) for c in chain) if p not in known]
         if not added:
-            return False
+            if root_note:
+                return fail(root_note)
+            if known:
+                return fail("сохранённые ранее промежуточные сертификаты не помогли")
+            return fail("недостающих сертификатов не нашлось")
         ISSUERS_DIR.mkdir(exist_ok=True)
         extra.write_text(known + "".join(added), encoding="ascii")
         self.host_bundles.pop(host, None)
+        names = ", ".join(f"«{cert_cn(ssl.PEM_cert_to_DER_cert(p))}»" for p in added)
+        log.info("%s: добавлены сертификаты %s", host, names)
+        # если и с ними не откроется, в ошибке будет видно, что докачка была
+        self.issuer_notes[host] = f"докачаны сертификаты {names}, но цепочка всё равно не сошлась" + (
+            f"; {root_note}" if root_note else "")
         return True
+
+    def _trusted_subjects(self, host: str) -> set[bytes]:
+        """Владельцы сертификатов, которым скрипт уже доверяет для этого сайта."""
+        subjects = set()
+        paths = [self._base_bundle(host)]
+        own = _host_file(host, ".crt")
+        if own.is_file():
+            paths.append(str(own))
+        for path in paths:
+            try:
+                text = Path(path).read_text(encoding="ascii", errors="ignore")
+            except OSError:
+                continue
+            for block in re.findall(r"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", text, re.S):
+                try:
+                    subjects.add(cert_names(ssl.PEM_cert_to_DER_cert(block))[1])
+                except ValueError:
+                    continue
+        return subjects
+
+    @staticmethod
+    def _system_root(subject: bytes) -> bytes | None:
+        """Корневой сертификат с таким владельцем из хранилища Windows («Доверенные корневые центры»)."""
+        for der in system_roots():
+            try:
+                issuer, owner = cert_names(der)
+            except ValueError:
+                continue
+            if owner == subject and issuer == owner:
+                return der
+        return None
 
     def _pace(self, url: str) -> None:
         host = urlparse(url).hostname or ""
@@ -1173,10 +1281,17 @@ class Http:
                         ) from exc
                     if "local issuer" in low and self.fetch_missing_issuer(url):
                         continue  # докачали промежуточный сертификат — повторяем с ним
-                    if is_ru_zone(host) and not self.bundle:
+                    note = self.issuer_notes.get(host)
+                    # совет про сертификат Минцифры, если только цепочка не привела к другому корневому
+                    other_root = bool(note) and "нет среди доверенных" in note and "Russian Trusted" not in note
+                    if is_ru_zone(host) and not self.bundle and not other_root:
                         raise FetchError(
                             "сайт использует сертификат Минцифры. Выполните: python tender_monitor.py --setup-cert"
                         ) from exc
+                    if note:
+                        m = re.search(r"certificate verify failed: (.+?)(?: \(_ssl|'|\)|$)", str(exc))
+                        reason = f" ({m.group(1)})" if m else ""
+                        raise FetchError(f"ошибка сертификата{reason}: {note}") from exc
                     raise FetchError(f"ошибка сертификата: {short_err(exc)}") from exc
                 # обрыв соединения во время TLS-рукопожатия (так часто блокируют зарубежные IP) — не сертификат
                 log.debug("%s: %s", url, exc)
@@ -1413,6 +1528,8 @@ FILE_HREF_RE = re.compile(
     r"(?i)/filesystem/|/upload/|\.(?:zip|rar|7z|docx?|xlsx?|pptx?|pdf|rtf|odt|ods|txt|csv|sig|p7s"
     r"|jpe?g|png|gif|bmp|tiff?|webp|dwg|dxf|gsfx)(?:[?#]|$)"
 )
+# Поле карточки, а не название: «Стоимость закупки: 782609», «Дата окончания: 05.10.2026 10:00»
+FIELD_ONLY_RE = re.compile(r"^[^:]{2,60}:\s*[\d\s.,:/()₽-]*(?:руб\w*\.?)?\s*$", re.I)
 # Текст ссылки — имя файла: «шильд М1 поворота.jpg», «КЖ-Навес к закупке.gsfx»
 FILE_NAME_RE = re.compile(r"(?i)\.[a-z][a-z0-9]{1,4}$")
 JS_APP_RE = re.compile(
@@ -1711,7 +1828,7 @@ def _generic_items(src: Source, soup, base: str, host: str) -> list[Item]:
     def add(raw: str, block: str, link: str) -> None:
         # убираем меняющиеся фрагменты («осталось 3 дня»), иначе тендер будет «новым» каждый день
         title, full = _title_pair(raw)
-        if len(title) < 15:
+        if len(title) < 15 or FIELD_ONLY_RE.match(title):
             return
         key = norm(title)
         if key in seen_titles:
@@ -2536,10 +2653,14 @@ def probe_hint(src: Source, info: dict, error: str) -> str:
     if "выписан на другой адрес" in error:
         return ("Откройте адрес в браузере: если браузер тоже предупреждает о сертификате, сайт настроен "
                 "с ошибкой. Если сайт переехал, поменяйте url; иначе источник лучше выключить (enabled = false).")
+    if "ошибка сертификата" in error and "нет среди доверенных" in error:
+        return ("Откройте адрес в браузере. Если браузер открывает сайт без предупреждений, пришлите этот отчёт "
+                "и файл tender_monitor.log: корневой сертификат можно будет добавить. Если браузер тоже "
+                "предупреждает, источник лучше выключить (enabled = false).")
     if "ошибка сертификата" in error and is_ru_zone(host):
-        return ("Скрипт уже пробовал докачать промежуточный сертификат сайта. Если --setup-cert ещё не "
-                "выполнялся, выполните python tender_monitor.py --setup-cert. Если ошибка останется, "
-                "откройте адрес в браузере: при предупреждении о сертификате источник лучше выключить.")
+        return ("Если --setup-cert ещё не выполнялся, выполните python tender_monitor.py --setup-cert. Если "
+                "ошибка останется, пришлите этот отчёт; при предупреждении о сертификате в браузере источник "
+                "лучше выключить.")
     if "не найдено ни одного тендера" in error:
         html = info.get("html", "")
         text_len = len(BeautifulSoup(html, "html.parser").get_text(" ", strip=True)) if html else 0
