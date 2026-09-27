@@ -64,7 +64,7 @@ except ModuleNotFoundError:
     print("Не хватает библиотек. Установите их командой:\n    pip install requests beautifulsoup4")
     sys.exit(1)
 
-VERSION = "1.6"
+VERSION = "1.7"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.toml"
 DB_PATH = BASE_DIR / "tender_monitor.db"
@@ -211,7 +211,8 @@ max_gap = 6
 
 [[rules]]
 name = "Нефтешлам и донные отложения"
-enabled = true
+# Выключено: нужны только светлые нефтепродукты (раздел [product] ниже).
+enabled = false
 words = ["нефтешлам", "донных отложений", "донные отложения", "шлам очистки емкостей"]
 
 [[rules]]
@@ -236,6 +237,25 @@ words = ["септик", "септич", "выгребн", "жбо", "бытов
          "сооружений канализации", "канализационных очистных", "канализационных насосных",
          "биологической очистки", "благоустройств", "озеленен",
          "противогаз", "молок", "пищев", "бассейн", "аквариум"]
+
+# Вид нефтепродукта. Проверяется после правил: тендер уже подошёл по словам.
+# Если в названии есть слово из light — тендер присылается.
+# Если светлых слов нет, но есть слово из dark — тендер пропускается.
+# Если нет ни тех, ни других («зачистка резервуаров хранения», «ГСМ»,
+# «нефтепродукты»), решает send_unspecified: true — прислать с пометкой
+# «вид нефтепродукта не указан», false — пропустить.
+# Выключить отбор по виду продукта: enabled = false.
+[product]
+enabled = true
+send_unspecified = true
+light = ["светл", "бензин", "дизел", "дт", "керосин", "авиакеросин", "авиатоплив", "авиагсм",
+         "тс-1", "реактивн", "аи-92", "аи-95", "аи-98", "азс", "азк", "автозаправ",
+         "бензовоз", "топливозаправщик", "моторн топлив", "хадт"]
+dark = ["мазут", "топочн", "печн", "нефть", "нефти", "нефтью", "сырой нефт", "битум", "гудрон",
+        "масл", "отработанн", "нефтесодерж",
+        "воды", "водой", "водян", "водоснаб", "водопровод", "питьев", "пожарн", "канализ",
+        "сточн", "ливнев", "дождев", "очистных сооружен", "ила", "илов", "осадк", "водосбор",
+        "сжиженн", "газгольдер", "суг"]
 
 
 # ---------------------------------------------------------------------------
@@ -672,6 +692,7 @@ class Item:
     query: str = ""           # поисковая фраза ленты ЕИС
     rules: list[str] = field(default_factory=list)
     region: str = "unknown"   # my / other / unknown
+    product: str = ""         # light / unspecified (вид нефтепродукта), пусто — отбор выключен
 
     def published_dt(self) -> datetime | None:
         if not self.published:
@@ -831,6 +852,28 @@ class Matcher:
             if patterns:
                 self.rules.append((name, patterns))
         self.exclude = [norm(str(w)) for w in cfg.get("exclude", {}).get("words", []) if str(w).strip()]
+        product = cfg.get("product", {})
+        self.product_on = bool(product.get("enabled", False))
+        self.send_unspecified = bool(product.get("send_unspecified", True))
+
+        def words_re(words) -> re.Pattern | None:
+            stems = [str(w) for w in words if str(w).strip()]
+            return re.compile(r"(?<!\w)(?:" + "|".join(_stem_re(w) for w in stems) + ")") if stems else None
+
+        self.light = words_re(product.get("light", []))
+        self.dark = words_re(product.get("dark", []))
+
+    def product_kind(self, fields: list[str]) -> tuple[str, str]:
+        """Вид нефтепродукта по названию: ("light" | "dark" | "unspecified", найденное слово).
+        Если отбор выключен — ("", "")."""
+        if not self.product_on:
+            return "", ""
+        text = " ".join(norm(f) for f in fields if f)
+        for kind, pattern in (("light", self.light), ("dark", self.dark)):
+            m = pattern.search(text) if pattern else None
+            if m:
+                return kind, m.group(0)
+        return "unspecified", ""
 
     def excluded_by(self, texts: list[str]) -> str:
         joined = " ".join(texts)
@@ -2363,6 +2406,8 @@ def item_html(item: Item, label: str) -> str:
         lines.append("Приём заявок до: " + esc(item.deadline))
     if item.unnamed:
         lines.append("Названия нет в ленте ЕИС, запрос найден в документах закупки.")
+    elif item.product == "unspecified":
+        lines.append("Вид нефтепродукта в названии не указан.")
     lines.append("Источник: " + esc(item.source))
     return "\n".join(lines)
 
@@ -2376,6 +2421,8 @@ def item_text(item: Item, label: str) -> str:
             lines.append(f"{name}: {truncate(value, 200)}")
     if item.unnamed:
         lines.append("Названия нет в ленте ЕИС, запрос найден в документах закупки.")
+    elif item.product == "unspecified":
+        lines.append("Вид нефтепродукта в названии не указан.")
     lines.append(f"Источник: {item.source}")
     if item.link:
         lines.append(item.link)
@@ -2578,6 +2625,9 @@ def evaluate(item: Item, matcher: Matcher, regions: RegionFilter, settings: dict
         # у малых закупок ЕИС не присылает название; доверяем, если сам запрос ленты про нашу тему
         item.rules = ["Совпадение в документах ЕИС"]
     if not item.rules:
+        return False
+    item.product, _ = matcher.product_kind(fields)
+    if item.product == "dark" or (item.product == "unspecified" and not matcher.send_unspecified):
         return False
     item.region = regions.classify(item)
     if settings.get("only_my_regions", True) and item.region == "other":
@@ -3075,6 +3125,12 @@ def cmd_check(cfg: dict, text: str) -> int:
         print("Подходит по правилам: " + ", ".join(rules))
     else:
         print("Не подходит: ни одно правило не сработало")
+    kind, word = matcher.product_kind([text])
+    if kind:
+        print({"light": f"Нефтепродукт: светлый («{word}»)",
+               "dark": f"Нефтепродукт: не светлый («{word}»), тендер пропускается",
+               "unspecified": "Нефтепродукт: не указан, " + ("придёт с пометкой" if matcher.send_unspecified
+                                                           else "тендер пропускается")}[kind])
     label = settings.get("region_label", "ваш регион")
     print(f"Регион: {label}" if region == "my" else "Регион: в тексте не найден")
     return 0

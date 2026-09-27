@@ -34,6 +34,7 @@ tm.log.addHandler(logging.NullHandler())  # предупреждения скр�
 CFG = tm.tomllib.loads(tm.DEFAULT_CONFIG)
 SETTINGS = CFG["settings"]
 MATCHER = tm.Matcher(CFG)
+ANY_PRODUCT = tm.Matcher(dict(CFG, product={"enabled": False}))  # без отбора по виду нефтепродукта
 REGIONS = tm.RegionFilter(SETTINGS)
 STRICT = dict(SETTINGS, max_age_days=0)                        # регион учитывается, возраст нет
 LOOSE = dict(SETTINGS, max_age_days=0, only_my_regions=False)  # только слова
@@ -91,8 +92,8 @@ def source(raw: dict) -> tm.Source:
     return tm.load_sources({"sources": [raw]})[0]
 
 
-def wanted(items, settings=STRICT) -> list[str]:
-    return [i.uid for i in items if tm.evaluate(i, MATCHER, REGIONS, settings)]
+def wanted(items, settings=STRICT, matcher=MATCHER) -> list[str]:
+    return [i.uid for i in items if tm.evaluate(i, matcher, REGIONS, settings)]
 
 
 class RosTenderRss(unittest.TestCase):
@@ -260,8 +261,9 @@ class EuroChem(unittest.TestCase):
         self.assertEqual(info["required"], (4, 2))
         self.assertEqual([i.uid for i in items], ["html:zakupki.eurochem.ru:4616001", "html:zakupki.eurochem.ru:4608364"])
         self.assertTrue(items[0].link.startswith("https://www.b2b-center.ru/"))
-        self.assertEqual([i.title for i in items if tm.evaluate(i, MATCHER, REGIONS, STRICT)],
+        self.assertEqual([i.title for i in items if tm.evaluate(i, ANY_PRODUCT, REGIONS, STRICT)],
                          ["ЗАЧИСТКА РЕЗЕРВУАРОВ ХРАНЕНИЯ МАЗУТА КОТЕЛЬНОЙ"])
+        self.assertEqual(wanted(items), [])  # мазут — не светлый нефтепродукт
 
 
 class Ksk(unittest.TestCase):
@@ -294,9 +296,10 @@ class Ksk(unittest.TestCase):
     def test_old_tenders_are_not_sent(self):
         old = self.items[-1]
         self.assertIn("очистке аккумулирующего резервуара", old.title)
-        self.assertEqual(wanted(self.items, LOOSE), [old.uid])  # по словам подходит
+        self.assertEqual(wanted(self.items, LOOSE, ANY_PRODUCT), [old.uid])  # по словам подходит
         with patched(tm, "now_utc", lambda: tm.datetime(2026, 9, 27, tzinfo=tm.timezone.utc)):
-            self.assertEqual(wanted(self.items, SETTINGS), [])  # но ей 8 лет
+            self.assertEqual(wanted(self.items, SETTINGS, ANY_PRODUCT), [])  # но ей 8 лет
+        self.assertEqual(wanted(self.items, LOOSE), [])  # и это очистные сооружения, а не нефтепродукты
 
 
 class GenericPage(unittest.TestCase):
@@ -350,12 +353,76 @@ class Robots(unittest.TestCase):
         self.assertTrue(pdf.allowed("https://x.ru/a.pdf?x=1"))
 
 
+class LightProducts(unittest.TestCase):
+    """Нужны только светлые нефтепродукты: тёмные и не нефтепродукты отсеиваются,
+    а тендеры без вида продукта приходят с пометкой."""
+    LIGHT = [
+        "Оказание услуг на чистку емкостей под дизельное топливо",
+        "Зачистка резервуаров АЗС от остатков бензина",
+        "Оказание услуг по зачистке резервуаров на АЗС и нефтебазах",
+        "Зачистка резервуаров хранения авиатоплива ТС-1",
+        "Пропарка и дегазация бензовозов",
+        "Зачистка резервуаров ДТ и откачка подтоварной воды",
+        "Выполнение работ по зачистке металлических резервуаров для дизельного топлива",
+        "Оказание услуг по зачистке резервуара ХАДТ ТЭЦ-1",
+    ]
+    DARK = [
+        "Зачистка мазутных емкостей и утилизация нефтешлама",
+        "ЗАЧИСТКА РЕЗЕРВУАРОВ ХРАНЕНИЯ МАЗУТА КОТЕЛЬНОЙ",
+        "Выполнение работ по размыву донных отложений резервуаров хранения сырой нефти",
+        "Регламентные работы по очистке и обеззараживанию резервуара чистой воды",
+        "Оказание услуг по очистке емкостей питьевой воды",
+        "Очистка резервуаров очистных сооружений ОТЭКО-Портсервис",
+        "Зачистка резервуаров отработанного масла",
+        "Оказание услуг по периодической зачистке резервуаров для хранения нефти",
+        "Зачистка газовых емкостей (газгольдеров) из-под сжиженного газа",
+        "Оказание услуг по очистке водосборной емкости от иловых отложений",
+    ]
+    UNSPECIFIED = [
+        "Оказание услуг по зачистке ёмкостей (резервуаров) для хранения ГСМ",
+        "Оказание услуг по зачистке резервуаров хранения",
+        "Выполнение работ по зачистке средств хранения нефтепродуктов",
+        "Выполнение работ по техническому диагностированию и зачистке технических средств службы горючего",
+    ]
+
+    @staticmethod
+    def item(title):
+        return tm.Item(uid="t:" + title, title=title, link="", source="т")
+
+    def test_kinds(self):
+        for kind, titles in (("light", self.LIGHT), ("dark", self.DARK), ("unspecified", self.UNSPECIFIED)):
+            for title in titles:
+                with self.subTest(title=title):
+                    self.assertTrue(MATCHER.match([title]) or ANY_PRODUCT.match([title]))
+                    self.assertEqual(MATCHER.product_kind([title])[0], kind)
+
+    def test_sending(self):
+        loose = dict(LOOSE)
+        for title in self.LIGHT + self.UNSPECIFIED:
+            with self.subTest(title=title):
+                item = self.item(title)
+                self.assertTrue(tm.evaluate(item, MATCHER, REGIONS, loose))
+        for title in self.DARK:
+            with self.subTest(title=title):
+                self.assertFalse(tm.evaluate(self.item(title), MATCHER, REGIONS, loose))
+        unspecified = self.item(self.UNSPECIFIED[0])
+        tm.evaluate(unspecified, MATCHER, REGIONS, loose)
+        self.assertIn("Вид нефтепродукта в названии не указан", tm.item_html(unspecified, "ЮФО"))
+        light = self.item(self.LIGHT[0])
+        tm.evaluate(light, MATCHER, REGIONS, loose)
+        self.assertNotIn("не указан", tm.item_text(light, "ЮФО"))
+
+    def test_unspecified_can_be_switched_off(self):
+        strict = tm.Matcher(dict(CFG, product=dict(CFG["product"], send_unspecified=False)))
+        self.assertFalse(tm.evaluate(self.item(self.UNSPECIFIED[0]), strict, REGIONS, LOOSE))
+        self.assertTrue(tm.evaluate(self.item(self.LIGHT[0]), strict, REGIONS, LOOSE))
+
+
 class Words(unittest.TestCase):
     POSITIVE = [
         "Оказание услуг по зачистке резервуаров",
         "Выполнение работ позачистке и демонтажу подземных железобетонных резервуаров",
         "Зачистка газовых емкостей из-под сжиженного газа",
-        "Оказание услуг по сбору, зачистке нефтешлама и ила",
         "Выполнение работ по размыву донных отложений резервуаров хранения сырой нефти",
         "Оказание услуг на чистку емкостей под дизельное топливо",
         "Пропарка и дегазация автоцистерн",
