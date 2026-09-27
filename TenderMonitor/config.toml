@@ -349,8 +349,10 @@ page_url = "https://www.ahstep.ru/tender?status=1&page={page}"
 pages = 5
 every_minutes = 60
 
+# Выключен: сайт не отвечает (сентябрь 2026).
 [[sources]]
 name = "Агрокомплекс им. Ткачёва"
+enabled = false
 type = "html"
 url = "https://tender.zao-agrokomplex.ru/purchase/"
 
@@ -364,13 +366,17 @@ name = "ОТЭКО (Таманьнефтегаз)"
 type = "html"
 url = "https://www.oteko.ru/suppliers/what_are_we_buying/"
 
+# Выключен: адрес nmtp.info больше не существует (сентябрь 2026).
 [[sources]]
 name = "НМТП"
+enabled = false
 type = "html"
 url = "https://www.nmtp.info/holding/announcement/"
 
+# Выключен: сертификат сайта выписан на другой адрес (сентябрь 2026).
 [[sources]]
 name = "Черноморнефтегаз"
+enabled = false
 type = "html"
 url = "https://gas.crimea.ru/gosudarstvennye-zakupki"
 

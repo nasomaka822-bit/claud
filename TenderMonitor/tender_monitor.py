@@ -66,7 +66,7 @@ except ModuleNotFoundError:
     print("Не хватает библиотек. Установите их командой:\n    pip install requests beautifulsoup4")
     sys.exit(1)
 
-VERSION = "1.8"
+VERSION = "1.9"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.toml"
 DB_PATH = BASE_DIR / "tender_monitor.db"
@@ -75,6 +75,10 @@ LOCK_PATH = BASE_DIR / "tender_monitor.lock"
 BUNDLE_PATH = BASE_DIR / "ca_bundle_ru.pem"
 ISSUERS_DIR = BASE_DIR / "issuer_certs"  # промежуточные сертификаты, которые сайты не отдают сами
 PROBE_REPORT_PATH = BASE_DIR / "probe_report.txt"
+BACKUP_DIR = BASE_DIR / "backups"          # копии базы, одна в сутки, хранятся последние BACKUP_KEEP
+BACKUP_KEEP = 7
+SHRINK_ALERT = 0.3          # страница вернула меньше этой доли обычного числа записей — предупредить
+CERT_WARN_DAYS = 30         # за сколько дней предупреждать об окончании сертификата
 PROBE_PAGES_DIR = BASE_DIR / "probe_pages"  # страницы компаний, сохранённые --probe для разбора вёрстки
 
 BOT_NAME = "TenderMonitor"
@@ -447,8 +451,10 @@ page_url = "https://www.ahstep.ru/tender?status=1&page={page}"
 pages = 5
 every_minutes = 60
 
+# Выключен: сайт не отвечает (сентябрь 2026).
 [[sources]]
 name = "Агрокомплекс им. Ткачёва"
+enabled = false
 type = "html"
 url = "https://tender.zao-agrokomplex.ru/purchase/"
 
@@ -462,13 +468,17 @@ name = "ОТЭКО (Таманьнефтегаз)"
 type = "html"
 url = "https://www.oteko.ru/suppliers/what_are_we_buying/"
 
+# Выключен: адрес nmtp.info больше не существует (сентябрь 2026).
 [[sources]]
 name = "НМТП"
+enabled = false
 type = "html"
 url = "https://www.nmtp.info/holding/announcement/"
 
+# Выключен: сертификат сайта выписан на другой адрес (сентябрь 2026).
 [[sources]]
 name = "Черноморнефтегаз"
+enabled = false
 type = "html"
 url = "https://gas.crimea.ru/gosudarstvennye-zakupki"
 
@@ -1178,6 +1188,31 @@ def _response_sockets(raw) -> list:
     fp = getattr(getattr(raw, "_fp", None), "fp", None)  # http.client.HTTPResponse → BufferedReader
     found.append(getattr(getattr(fp, "raw", None), "_sock", None))  # → SocketIO → сокет
     return [s for s in found if s is not None and hasattr(s, "getpeercert")]
+
+
+def cert_not_after(der: bytes) -> datetime | None:
+    """Дата окончания сертификата (поле notAfter)."""
+    try:
+        _, pos, _ = _der_element(der, 0)
+        _, pos, end = _der_element(der, pos)
+        fields = []
+        while pos < end and len(fields) < 5:
+            start = pos
+            pos = _der_element(der, pos)[2]
+            fields.append(der[start:pos])
+        if fields and fields[0][0] == 0xA0:
+            fields = fields[1:]
+        validity = fields[3]
+        _, vpos, _ = _der_element(validity, 0)
+        vpos = _der_element(validity, vpos)[2]           # notBefore
+        tag, a, b = _der_element(validity, vpos)         # notAfter
+        text = validity[a:b].decode("ascii").rstrip("Z")
+        if tag == 0x17:  # UTCTime: ГГММДДччммсс
+            year = int(text[:2])
+            text = str(1900 + year if year >= 50 else 2000 + year) + text[2:]
+        return datetime.strptime(text[:14], "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+    except (ValueError, IndexError):
+        return None
 
 
 def _host_file(host: str, suffix: str) -> Path:
@@ -2284,10 +2319,16 @@ class Store:
     def __init__(self, path: Path | str):
         self.db = sqlite3.connect(str(path), timeout=30)
         self.db.row_factory = sqlite3.Row
+        if str(path) != ":memory:":
+            # WAL: бот и проверка пишут в базу одновременно, а карта памяти Raspberry Pi изнашивается меньше
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.executescript(SCHEMA)
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(sources)")}
         if "last_check" not in columns:  # база от версии 1.0
             self.db.execute("ALTER TABLE sources ADD COLUMN last_check TEXT")
+        if "avg_count" not in columns:  # версия 1.9: обычное число записей источника
+            self.db.execute("ALTER TABLE sources ADD COLUMN avg_count REAL")
         self.db.commit()
 
     def due(self, src: Source, state: sqlite3.Row) -> bool:
@@ -2333,6 +2374,27 @@ class Store:
             self.db.execute("INSERT INTO sources (key, name) VALUES (?, ?)", (src.key, src.name))
             row = self.db.execute("SELECT * FROM sources WHERE key = ?", (src.key,)).fetchone()
         return row
+
+    def source_shrank(self, src: Source, count: int) -> str:
+        """Текст предупреждения, если страница вдруг отдала намного меньше записей, чем обычно.
+        Так выглядит смена вёрстки: ошибки нет, но разбор находит лишь часть тендеров или мусор.
+        Предупреждает один раз, пока число записей не вернётся к обычному."""
+        row = self.db.execute("SELECT avg_count FROM sources WHERE key = ?", (src.key,)).fetchone()
+        avg = row["avg_count"] if row else None
+        self.db.execute("UPDATE sources SET avg_count = ? WHERE key = ?",
+                        (count if avg is None else avg * 0.8 + count * 0.2, src.key))
+        if src.type != "html" or avg is None or avg < 10:
+            return ""  # в RSS-лентах число записей и так скачет
+        flag = "shrank:" + src.key
+        if count >= avg * SHRINK_ALERT:
+            if self.kv_get(flag):
+                self.kv_set(flag, None)
+            return ""
+        if self.kv_get(flag):
+            return ""
+        self.kv_set(flag, True)
+        return (f"Источник «{src.name}» вернул {count} записей вместо обычных ~{round(avg)}. Возможно, сайт "
+                f"изменил вёрстку. Проверьте: python tender_monitor.py --probe \"{src.name}\"")
 
     def source_ok(self, src: Source, count: int) -> None:
         self.db.execute(
@@ -2418,6 +2480,63 @@ class Store:
 # ---------------------------------------------------------------------------
 
 REGION_NAMES = {"other": "другой регион", "unknown": "регион не определён"}
+
+
+def certificate_warnings(cfg: dict, store: Store) -> list[str]:
+    """Предупреждения о сертификатах, которые скоро закончатся: Минцифры (ЕИС) и докачанные для сайтов.
+    О каждом — не чаще раза в неделю."""
+    files = [BASE_DIR / str(n) for n in cfg.get("certs", {}).get("ca_files", [])]
+    if ISSUERS_DIR.is_dir():
+        files += sorted(ISSUERS_DIR.glob("*.crt")) + sorted(ISSUERS_DIR.glob("*.cer"))
+    warnings = []
+    now = now_utc()
+    for path in files:
+        if not path.is_file():
+            continue
+        try:
+            text = _pem_from_file(path)
+        except (OSError, ValueError):
+            continue
+        for block in re.findall(r"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", text, re.S):
+            try:
+                der = ssl.PEM_cert_to_DER_cert(block)
+            except ValueError:
+                continue
+            ends = cert_not_after(der)
+            if not ends or ends - now > timedelta(days=CERT_WARN_DAYS):
+                continue
+            key = f"certwarn:{path.name}:{cert_cn(der)}"
+            last = store.kv_get(key)
+            if last and now - datetime.fromisoformat(last) < timedelta(days=7):
+                continue
+            store.kv_set(key, now.isoformat())
+            when = ends.astimezone(MSK).strftime("%d.%m.%Y")
+            if path.parent == ISSUERS_DIR:
+                fix = f"удалите файл issuer_certs/{path.name}, скрипт скачает новый сам"
+            else:
+                fix = "выполните python tender_monitor.py --setup-cert"
+            state = "закончился" if ends <= now else "заканчивается"
+            warnings.append(f"Сертификат «{cert_cn(der)}» ({path.name}) {state} {when}: {fix}.")
+    return warnings
+
+
+def backup_database(store: Store) -> None:
+    """Копия базы раз в сутки (backups/tender_monitor-ГГГГ-ММ-ДД.db), хранятся последние BACKUP_KEEP.
+    Без базы скрипт после сбоя карты памяти пришлёт все старые тендеры заново."""
+    if str(DB_PATH) == ":memory:":
+        return
+    target = BACKUP_DIR / f"tender_monitor-{now_utc().astimezone(MSK):%Y-%m-%d}.db"
+    if target.exists():
+        return
+    try:
+        BACKUP_DIR.mkdir(exist_ok=True)
+        with sqlite3.connect(str(target)) as copy:
+            store.db.backup(copy)
+        copy.close()
+        for old in sorted(BACKUP_DIR.glob("tender_monitor-*.db"))[:-BACKUP_KEEP]:
+            old.unlink()
+    except (OSError, sqlite3.Error) as exc:
+        log.warning("Не удалось сохранить копию базы: %s", short_err(exc))
 
 
 def item_html(item: Item, label: str) -> str:
@@ -2738,6 +2857,10 @@ def run_once(cfg: dict, *, dry_run: bool = False, report: dict | None = None) ->
                 if not dry_run:
                     store.mark_sent(fp, item.uid)
                     store.enqueue(item)
+        shrank = store.source_shrank(src, len(items)) if not bootstrap else ""
+        if shrank:
+            alerts.append(shrank)
+            log.warning(shrank)
         store.source_ok(src, len(items))
         store.commit()
         stats["ok"] += 1
@@ -2779,8 +2902,12 @@ def run_once(cfg: dict, *, dry_run: bool = False, report: dict | None = None) ->
     if alerts:
         announce(notifiers, "\n".join(alerts))
 
+    alerts_cert = certificate_warnings(cfg, store)
+    if alerts_cert:
+        announce(notifiers, "\n".join(alerts_cert))
     store.prune()
     store.commit()
+    backup_database(store)
     if report is not None:
         report.update(ok=stats["ok"], total=len(sources), failed=failed_names, later=stats["later"],
                       new=len(new_items), digest=len(digest), first_run=first_run)
@@ -3221,6 +3348,7 @@ BOT_COMMANDS = [
     ("phrase", "проверить название: /phrase Зачистка резервуаров ДТ"),
     ("pause", "остановить проверки по расписанию"),
     ("resume", "возобновить проверки по расписанию"),
+    ("version", "версия скрипта и окружение"),
     ("help", "список команд"),
 ]
 TIME_RE = re.compile(r"^([01]?\d|2[0-3])[:.]([0-5]\d)$")
@@ -3512,6 +3640,9 @@ class BotController:
         lines.append("Регион: " + (str(self.cfg["settings"].get("region_label", "ваш")) if region == "my"
                                    else "в тексте не найден (такие приходят)"))
         self.bot.say("\n".join(lines))
+
+    def cmd_version(self, args: str) -> None:
+        self.bot.say(f"Версия скрипта {VERSION}.\n" + environment_line(Http(self.cfg)))
 
     def cmd_pause(self, args: str) -> None:
         self.store.kv_set("paused", True)

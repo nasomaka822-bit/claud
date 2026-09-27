@@ -10,3 +10,4 @@ TenderMonitor/ca_bundle_ru.pem
 TenderMonitor/issuer_certs/
 TenderMonitor/probe_pages/
 TenderMonitor/.venv/
+TenderMonitor/backups/

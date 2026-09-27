@@ -971,5 +971,65 @@ class Bot(unittest.TestCase):
         self.assertIn("Последняя проверка по команде", self.send("/status"))
 
 
+class LongRun(unittest.TestCase):
+    """Что должно работать через полгода: тихая поломка источника, сертификаты, копии базы."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.enterContext(patched(tm, "DB_PATH", self.dir / "t.db"))
+        self.enterContext(patched(tm, "BACKUP_DIR", self.dir / "backups"))
+        self.enterContext(patched(tm, "ISSUERS_DIR", self.dir / "issuer_certs"))
+        self.store = tm.Store(tm.DB_PATH)
+
+    def test_page_suddenly_returns_few_records(self):
+        src = source({"name": "КСК", "type": "html", "url": "https://www.gt-ksk.com/about/tenders/"})
+        self.store.source_state(src)
+        for _ in range(3):
+            self.assertEqual(self.store.source_shrank(src, 540), "")
+        alert = self.store.source_shrank(src, 12)
+        self.assertIn("вернул 12 записей вместо обычных ~540", alert)
+        self.assertEqual(self.store.source_shrank(src, 12), "")  # второй раз не повторяет
+        for _ in range(12):
+            self.store.source_shrank(src, 540)
+        self.assertIn("вернул 3 записей", self.store.source_shrank(src, 3))  # после восстановления — снова
+        rss = source({"name": "РТ", "type": "rss", "url": "https://rostender.info/rss-category-839.xml"})
+        self.store.source_state(rss)
+        for count in (30, 30, 0):
+            self.assertEqual(self.store.source_shrank(rss, count), "")  # у лент число записей и так скачет
+
+    def test_certificate_end_date(self):
+        der = (FIX / "certs" / "intermediate.der").read_bytes()
+        end = tm.cert_not_after(der)
+        self.assertIsNotNone(end)
+        self.assertGreater(end.year, 2100)
+        self.assertIsNone(tm.cert_not_after(b"\x30\x03\x02\x01\x01"))
+
+    def test_certificate_warning(self):
+        tm.ISSUERS_DIR.mkdir()
+        (tm.ISSUERS_DIR / "aston.ru.crt").write_bytes((FIX / "certs" / "intermediate.der").read_bytes())
+        self.assertEqual(tm.certificate_warnings(CFG, self.store), [])  # до окончания далеко
+        with patched(tm, "cert_not_after", lambda der: tm.now_utc() + timedelta(days=10)):
+            warnings = tm.certificate_warnings(CFG, self.store)
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("заканчивается", warnings[0])
+            self.assertIn("удалите файл issuer_certs/aston.ru.crt", warnings[0])
+            self.assertEqual(tm.certificate_warnings(CFG, self.store), [])  # не чаще раза в неделю
+
+    def test_daily_backup_keeps_last_seven(self):
+        self.store.kv_set("x", 1)
+        tm.BACKUP_DIR.mkdir()
+        for day in range(1, 10):
+            (tm.BACKUP_DIR / f"tender_monitor-2026-01-{day:02d}.db").write_bytes(b"")
+        tm.backup_database(self.store)
+        files = sorted(p.name for p in tm.BACKUP_DIR.iterdir())
+        self.assertEqual(len(files), 7)
+        today = f"tender_monitor-{tm.now_utc().astimezone(tm.MSK):%Y-%m-%d}.db"
+        self.assertIn(today, files)
+        copy = tm.Store(tm.BACKUP_DIR / today)
+        self.assertEqual(copy.kv_get("x"), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

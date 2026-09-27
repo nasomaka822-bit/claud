@@ -1,0 +1,27 @@
+name: tender-monitor tests
+
+on:
+  push:
+    paths: ["TenderMonitor/**", ".github/workflows/tender-monitor-tests.yml"]
+  pull_request:
+    paths: ["TenderMonitor/**", ".github/workflows/tender-monitor-tests.yml"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    defaults:
+      run:
+        working-directory: TenderMonitor
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          allow-prereleases: true
+      - run: pip install -r requirements.txt pyflakes
+      - run: python -m pyflakes tender_monitor.py tests/test_sources.py
+      - run: python -m unittest discover -s tests -v

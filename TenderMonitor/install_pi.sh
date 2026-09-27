@@ -28,12 +28,15 @@ if grep -q '^chat_id = ""' config.toml; then
     echo "Напишите боту в Telegram любое сообщение и снова запустите: bash install_pi.sh"; exit 1; }
 fi
 
+chmod 600 config.toml  # в нём токен бота: читать может только этот пользователь
+
 echo "== Создаю службу tender-monitor"
 sudo tee /etc/systemd/system/tender-monitor.service >/dev/null <<UNIT
 [Unit]
 Description=Мониторинг тендеров (Telegram-бот)
-After=network-online.target
-Wants=network-online.target
+# ждём сеть и синхронизацию часов: у Raspberry Pi без батарейки часы после включения неточные
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
 
 [Service]
 User=$USER
