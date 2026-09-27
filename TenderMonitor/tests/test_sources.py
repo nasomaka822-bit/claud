@@ -741,6 +741,43 @@ class MissingIntermediate(unittest.TestCase):
         raw = Obj(connection=Obj(sock=None), _fp=Obj(fp=Obj(raw=Obj(_sock=sock))))
         self.assertEqual(tm._response_sockets(raw), [sock])
 
+    def test_key_identifiers(self):
+        other = (self.CERTS / "intermediate_other_key.der").read_bytes()
+        self.assertEqual(tm.authority_key_id(self.site), tm.key_id(self.intermediate))
+        self.assertNotEqual(tm.key_id(other), tm.key_id(self.intermediate))
+        self.assertTrue(tm.issued_by(self.site, self.intermediate))
+        self.assertFalse(tm.issued_by(self.site, other))  # имя то же, ключ другой
+        self.assertTrue(tm.issued_by(self.intermediate, self.root))
+
+    def test_wrong_key_at_issuer_link(self):
+        """По ссылке лежит сертификат с тем же именем, но другим ключом (так было у aston.ru и oteko.ru)."""
+        other = (self.CERTS / "intermediate_other_key.der").read_bytes()
+        http = self.http({"http://pki.test/int.crt": other})
+        with patched(tm, "system_certificates", lambda store: []):
+            self.assertFalse(http.fetch_missing_issuer("https://aston.ru/tenders/"))
+        note = http.issuer_notes["aston.ru"]
+        self.assertIn("лежит «Test Intermediate CA» с другим ключом", note)
+        self.assertFalse(tm.ISSUERS_DIR.exists())  # чужой сертификат не сохраняется
+        src = source({"name": "Астон", "type": "html", "url": "https://aston.ru/tenders/"})
+        self.assertIn("issuer_certs", tm.probe_hint(src, {}, "ошибка сертификата: " + note))
+
+    def test_intermediate_from_windows_store(self):
+        other = (self.CERTS / "intermediate_other_key.der").read_bytes()
+        http = self.http({"http://pki.test/int.crt": other})
+        windows = {"CA": [other, self.intermediate], "ROOT": []}
+        with patched(tm, "system_certificates", lambda store: windows[store]):
+            self.assertTrue(http.fetch_missing_issuer("https://aston.ru/tenders/"))
+        saved = (tm.ISSUERS_DIR / "aston.ru.crt").read_text(encoding="ascii")
+        self.assertEqual(tm.ssl.PEM_cert_to_DER_cert(saved), self.intermediate)
+
+    def test_certificate_saved_from_browser(self):
+        tm.ISSUERS_DIR.mkdir()
+        (tm.ISSUERS_DIR / "www.oteko.ru.cer").write_bytes(self.intermediate)  # экспорт из браузера в DER
+        http = self.http({})
+        bundle = http.verify_for("https://www.oteko.ru/suppliers/")
+        self.assertIsInstance(bundle, str)
+        self.assertIn(tm.ssl.DER_cert_to_PEM_cert(self.intermediate).strip(), Path(bundle).read_text(encoding="ascii"))
+
     def test_get_retries_with_downloaded_intermediate(self):
         import requests
         http = self.http({"http://pki.test/int.crt": self.intermediate})

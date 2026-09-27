@@ -34,6 +34,7 @@ import os
 import random
 import re
 import smtplib
+import socket
 import sqlite3
 import ssl
 import sys
@@ -63,7 +64,7 @@ except ModuleNotFoundError:
     print("Не хватает библиотек. Установите их командой:\n    pip install requests beautifulsoup4")
     sys.exit(1)
 
-VERSION = "1.4"
+VERSION = "1.5"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.toml"
 DB_PATH = BASE_DIR / "tender_monitor.db"
@@ -1013,19 +1014,86 @@ def cert_cn(der: bytes) -> str:
         return "?"
 
 
-def system_roots() -> list[bytes]:
-    """Корневые сертификаты из хранилища Windows. На других системах — пусто:
-    там Python и так берёт сертификаты системы или certifi."""
+SKI_OID = bytes.fromhex("0603551d0e")  # 2.5.29.14 subjectKeyIdentifier
+AKI_OID = bytes.fromhex("0603551d23")  # 2.5.29.35 authorityKeyIdentifier
+
+
+def _extension(der: bytes, oid: bytes) -> bytes | None:
+    """Значение расширения сертификата (содержимое extnValue) или None."""
+    i = der.find(oid)
+    if i == -1:
+        return None
+    try:
+        pos = i + len(oid)
+        if der[pos] == 0x01:  # critical BOOLEAN
+            pos = _der_element(der, pos)[2]
+        tag, a, b = _der_element(der, pos)
+    except (ValueError, IndexError):
+        return None
+    return der[a:b] if tag == 0x04 else None
+
+
+def key_id(der: bytes) -> bytes | None:
+    """Идентификатор ключа владельца сертификата (Subject Key Identifier)."""
+    value = _extension(der, SKI_OID)
+    try:
+        tag, a, b = _der_element(value, 0) if value else (0, 0, 0)
+    except (ValueError, IndexError):
+        return None
+    return value[a:b] if tag == 0x04 else None
+
+
+def authority_key_id(der: bytes) -> bytes | None:
+    """Идентификатор ключа, которым подписан сертификат (Authority Key Identifier)."""
+    value = _extension(der, AKI_OID)
+    try:
+        tag, pos, end = _der_element(value, 0) if value else (0, 0, 0)
+        while tag == 0x30 and pos < end:
+            t, a, b = _der_element(value, pos)
+            if t == 0x80:  # [0] keyIdentifier
+                return value[a:b]
+            pos = b
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
+def issued_by(child: bytes, candidate: bytes) -> bool:
+    """Может ли candidate быть издателем child: по идентификатору ключа, а если его нет — по имени."""
+    try:
+        want, have = authority_key_id(child), key_id(candidate)
+        if want and have:
+            return want == have
+        return cert_names(candidate)[1] == cert_names(child)[0]
+    except ValueError:
+        return False
+
+
+def short_key(key: bytes | None) -> str:
+    return key[:6].hex(":") if key else "нет"
+
+
+def system_certificates(store: str) -> list[bytes]:
+    """Сертификаты из хранилища Windows: "ROOT" — доверенные корневые (только для TLS-серверов),
+    "CA" — промежуточные, которые Windows сама скачала и проверила, когда браузер открывал сайты.
+    На других системах — пусто."""
     if not hasattr(ssl, "enum_certificates"):
         return []
-    roots = []
+    found = []
     try:
-        for der, encoding, trust in ssl.enum_certificates("ROOT"):
-            if encoding == "x509_asn" and (trust is True or "1.3.6.1.5.5.7.3.1" in trust):  # serverAuth
-                roots.append(der)
+        for der, encoding, trust in ssl.enum_certificates(store):
+            if encoding != "x509_asn":
+                continue
+            if store == "ROOT" and not (trust is True or "1.3.6.1.5.5.7.3.1" in trust):  # serverAuth
+                continue
+            found.append(der)
     except OSError:
         pass
-    return roots
+    return found
+
+
+def system_roots() -> list[bytes]:
+    return system_certificates("ROOT")
 
 
 class HostTLSAdapter(requests.adapters.HTTPAdapter):
@@ -1135,6 +1203,7 @@ class Http:
         self.host_bundles: dict[str, str] = {}
         self.issuer_tried: set[str] = set()
         self.issuer_notes: dict[str, str] = {}
+        self.sent_chains: dict[str, list[bytes]] = {}  # что прислал сайт (Python 3.13+), для диагностики
 
     def _base_bundle(self, host: str) -> str:
         if self.bundle and is_ru_zone(host):
@@ -1145,13 +1214,15 @@ class Http:
         """Файл доверенных сертификатов для сайта, которому докачан промежуточный сертификат."""
         if host in self.host_bundles:
             return self.host_bundles[host]
-        extra = _host_file(host, ".crt")
-        if not extra.is_file():
+        # <сайт>.crt — докачанные скриптом, <сайт>.cer — сохранённые вручную из браузера (DER или Base64)
+        extras = [f for f in (_host_file(host, ".crt"), _host_file(host, ".cer")) if f.is_file()]
+        if not extras:
             return None
         path = _host_file(host, ".bundle.pem")
         try:
             base = Path(self._base_bundle(host)).read_text(encoding="ascii", errors="ignore")
-            path.write_text(base.strip() + "\n" + extra.read_text(encoding="ascii").strip() + "\n", encoding="ascii")
+            parts = [base.strip()] + [_pem_from_file(f).strip() for f in extras]
+            path.write_text("\n".join(parts) + "\n", encoding="ascii")
             ssl.create_default_context(cafile=str(path))
         except (OSError, ssl.SSLError) as exc:
             log.warning("%s: не удалось собрать файл сертификатов (%s)", host, short_err(exc))
@@ -1199,16 +1270,20 @@ class Http:
         if leaf_issuer is None:
             return fail(f"не удалось прочитать сертификат сайта ({why or 'сайт его не прислал'})")
         proxy = self._proxy_for(url)
+        sent = self.sent_chains.get(host) or []
         seen = (f"сайт показал сертификат «{cert_cn(der)}», выданный «{name_cn(leaf_issuer)}»"
-                + (f", запросы идут через прокси {proxy}" if proxy else ""))
+                + (f" (ключ издателя {short_key(authority_key_id(der))})" if authority_key_id(der) else "")
+                + (f"; сайт прислал цепочку: {' ← '.join(f'«{cert_cn(c)}»' for c in sent)}" if sent else "")
+                + (f"; запросы идут через прокси {proxy}" if proxy else ""))
         extra = _host_file(host, ".crt")
         known = extra.read_text(encoding="ascii") if extra.is_file() else ""
-        trusted = self._trusted_subjects(host)
+        trusted = self._trusted_certs(host)
         chain: list[bytes] = []  # промежуточные сверху вниз
+        notes: list[str] = []
         root_note = ""
         for _ in range(4):  # сайт → промежуточный → ещё один промежуточный → корневой
             issuer_name = cert_names(der)[0]
-            if issuer_name in trusted:
+            if any(issued_by(der, t) for t in trusted):
                 break  # издатель уже в доверенных, дальше идти не нужно
             urls = ca_issuer_urls(der)
             issuer_der = None
@@ -1219,50 +1294,84 @@ class Http:
                 except requests.RequestException as exc:
                     errors.append(f"{issuer_url}: {describe_request_error(exc)}")
                     continue
-                issuer_der = cert_der(resp.content) if resp.status_code == 200 else None
-                if issuer_der:
+                got = cert_der(resp.content) if resp.status_code == 200 else None
+                if got and issued_by(der, got):
+                    issuer_der = got
                     break
-                errors.append(f"{issuer_url}: " + (describe_status(resp.status_code) if resp.status_code != 200
-                                                   else "ответ не похож на сертификат"))
-            if not issuer_der:
-                issuer_der = self._system_root(issuer_name)  # Windows может знать корневой, которого нет в Python
-                if issuer_der:
-                    chain.append(issuer_der)
-                    log.info("%s: корневой «%s» взят из хранилища сертификатов Windows", host, cert_cn(issuer_der))
-                elif not urls:
-                    root_note = f"в сертификате «{cert_cn(der)}» нет ссылки на сертификат издателя «{name_cn(issuer_name)}»"
+                if got:
+                    # так бывает: по ссылке лежит сертификат с тем же именем, но с другим ключом
+                    notes.append(f"по ссылке {issuer_url} лежит «{cert_cn(got)}» с другим ключом "
+                                 f"({short_key(key_id(got))} вместо {short_key(authority_key_id(der))})")
                 else:
-                    root_note = "не удалось скачать сертификат издателя: " + "; ".join(errors)
-                break
+                    errors.append(f"{issuer_url}: " + (describe_status(resp.status_code) if resp.status_code != 200
+                                                       else "ответ не похож на сертификат"))
+            if not issuer_der:
+                # Windows хранит промежуточные сертификаты, которые скачала и проверила сама (например,
+                # когда браузер открывал этот сайт), и корневые, которым доверяет
+                issuer_der = next((c for c in system_certificates("CA") if issued_by(der, c)
+                                   and cert_names(c)[0] != cert_names(c)[1]), None)
+                if issuer_der:
+                    log.info("%s: промежуточный «%s» взят из хранилища Windows", host, cert_cn(issuer_der))
+                else:
+                    issuer_der = self._system_root(issuer_name, der)
+                    if issuer_der:
+                        chain.append(issuer_der)
+                        log.info("%s: корневой «%s» взят из хранилища Windows", host, cert_cn(issuer_der))
+                    elif not urls:
+                        root_note = (f"в сертификате «{cert_cn(der)}» нет ссылки на сертификат издателя "
+                                     f"«{name_cn(issuer_name)}»")
+                    elif errors:
+                        root_note = "не удалось скачать сертификат издателя: " + "; ".join(errors)
+                    else:
+                        root_note = f"подходящего сертификата издателя «{name_cn(issuer_name)}» не нашлось"
+                    break
             issuer, subject = cert_names(issuer_der)
             if issuer == subject:
                 # корневой, скачанный из интернета, не принимаем: доверяем только тому, что уже есть в системе
-                system = self._system_root(subject)
+                system = self._system_root(subject, der)
                 if system:
                     chain.append(system)
-                    log.info("%s: корневой «%s» взят из хранилища сертификатов Windows", host, cert_cn(system))
+                    log.info("%s: корневой «%s» взят из хранилища Windows", host, cert_cn(system))
                 else:
                     root_note = (f"цепочка сертификатов ведёт к корневому «{cert_cn(issuer_der)}», "
                                  f"которого нет среди доверенных")
                 break
             chain.append(issuer_der)
             der = issuer_der
-        added = [p for p in (ssl.DER_cert_to_PEM_cert(c) for c in chain) if p not in known]
-        if not added:
-            if root_note:
-                return fail(f"{root_note}; {seen}")
-            if known:
-                return fail(f"сохранённые ранее промежуточные сертификаты не помогли; {seen}")
-            return fail(f"недостающих сертификатов не нашлось; {seen}")
+        details = "; ".join(notes + ([root_note] if root_note else []) + [seen])
+        pems = [ssl.DER_cert_to_PEM_cert(c) for c in chain]
+        if not pems or "".join(pems) == known:
+            if known and pems:
+                return fail(f"сохранённые ранее промежуточные сертификаты не помогли; {details}")
+            return fail(details if (notes or root_note) else f"недостающих сертификатов не нашлось; {details}")
         ISSUERS_DIR.mkdir(exist_ok=True)
-        extra.write_text(known + "".join(added), encoding="ascii")
+        extra.write_text("".join(pems), encoding="ascii")  # цепочка целиком заменяет найденную раньше
         self.host_bundles.pop(host, None)
-        names = ", ".join(f"«{cert_cn(ssl.PEM_cert_to_DER_cert(p))}»" for p in added)
+        names = ", ".join(f"«{cert_cn(c)}»" for c in chain)
         log.info("%s: добавлены сертификаты %s", host, names)
         # если и с ними не откроется, в ошибке будет видно, что докачка была
-        self.issuer_notes[host] = (f"докачаны сертификаты {names}, но цепочка всё равно не сошлась"
-                                   + (f"; {root_note}" if root_note else "") + f"; {seen}")
+        self.issuer_notes[host] = f"докачаны сертификаты {names}, но цепочка всё равно не сошлась; {details}"
         return True
+
+    def direct_check(self, url: str) -> str:
+        """Проверка сертификата сайта напрямую через ssl, без requests и urllib3, с тем же файлом
+        сертификатов. Если она проходит, а запрос нет, дело не в сертификатах."""
+        parts = urlparse(url)
+        host = parts.hostname or ""
+        cafile = self._host_bundle(host)
+        if not cafile or self._proxy_for(url):
+            return ""
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.verify_flags &= ~getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
+        try:
+            context.load_verify_locations(cafile=cafile)
+            with socket.create_connection((host, parts.port or 443), timeout=15) as sock:
+                with context.wrap_socket(sock, server_hostname=host):
+                    return "прямая проверка через ssl проходит"
+        except ssl.SSLCertVerificationError as exc:
+            return f"прямая проверка через ssl: {exc.verify_message} (код {exc.verify_code})"
+        except (OSError, ssl.SSLError) as exc:
+            return f"прямая проверка через ssl не выполнилась: {short_err(exc)}"
 
     def _proxy_for(self, url: str) -> str:
         """Прокси, через который requests пойдёт к сайту: из настроек или системный (Windows, переменные)."""
@@ -1290,6 +1399,9 @@ class Http:
             for sock in _response_sockets(resp.raw):
                 der = sock.getpeercert(binary_form=True)
                 if der:
+                    if hasattr(sock, "get_unverified_chain"):  # Python 3.13+
+                        host = (urlparse(url).hostname or "").lower()
+                        self.sent_chains[host] = [bytes(c) for c in (sock.get_unverified_chain() or [])]
                     break
         except (OSError, ValueError, AttributeError) as exc:
             return None, short_err(exc)
@@ -1298,34 +1410,32 @@ class Http:
             probe.close()
         return der, ""
 
-    def _trusted_subjects(self, host: str) -> set[bytes]:
-        """Владельцы сертификатов, которым скрипт уже доверяет для этого сайта."""
-        subjects = set()
-        paths = [self._base_bundle(host)]
-        own = _host_file(host, ".crt")
-        if own.is_file():
-            paths.append(str(own))
-        for path in paths:
+    def _trusted_certs(self, host: str) -> list[bytes]:
+        """Сертификаты, которым скрипт уже доверяет для этого сайта (без докачанных раньше:
+        если они не помогли, их надо заменить, а не считать найденными)."""
+        certs = []
+        try:
+            text = Path(self._base_bundle(host)).read_text(encoding="ascii", errors="ignore")
+        except OSError:
+            return certs
+        for block in re.findall(r"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", text, re.S):
             try:
-                text = Path(path).read_text(encoding="ascii", errors="ignore")
-            except OSError:
+                der = ssl.PEM_cert_to_DER_cert(block)
+                cert_names(der)
+            except ValueError:
                 continue
-            for block in re.findall(r"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", text, re.S):
-                try:
-                    subjects.add(cert_names(ssl.PEM_cert_to_DER_cert(block))[1])
-                except ValueError:
-                    continue
-        return subjects
+            certs.append(der)
+        return certs
 
     @staticmethod
-    def _system_root(subject: bytes) -> bytes | None:
+    def _system_root(subject: bytes, child: bytes | None = None) -> bytes | None:
         """Корневой сертификат с таким владельцем из хранилища Windows («Доверенные корневые центры»)."""
         for der in system_roots():
             try:
                 issuer, owner = cert_names(der)
             except ValueError:
                 continue
-            if owner == subject and issuer == owner:
+            if owner == subject and issuer == owner and (child is None or issued_by(child, der)):
                 return der
         return None
 
@@ -1388,6 +1498,9 @@ class Http:
                         raise FetchError(
                             "сайт использует сертификат Минцифры. Выполните: python tender_monitor.py --setup-cert"
                         ) from exc
+                    if note and note.startswith("докачаны") and "прямая проверка" not in note:
+                        check = self.direct_check(url)
+                        note = self.issuer_notes[host] = note + (f"; {check}" if check else "")
                     if note:
                         m = re.search(r"certificate verify failed: (.+?)(?: \(_ssl|'|\)|$)", str(exc))
                         reason = f" ({m.group(1)})" if m else ""
@@ -2797,6 +2910,14 @@ def probe_hint(src: Source, info: dict, error: str) -> str:
         return ("Откройте адрес в браузере. Если браузер открывает сайт без предупреждений, пришлите этот отчёт "
                 "и файл tender_monitor.log: корневой сертификат можно будет добавить. Если браузер тоже "
                 "предупреждает, источник лучше выключить (enabled = false).")
+    if "ошибка сертификата" in error and ("с другим ключом" in error or "не нашлось" in error
+                                           or "не помогли" in error or "не сошлась" in error):
+        name = re.sub(r"[^\w.-]", "_", host)
+        return ("Скрипт не смог достроить цепочку сертификатов сам. Её можно взять из браузера: откройте "
+                f"{src.url} в Chrome или Edge, нажмите значок слева от адреса → «Безопасное подключение» → "
+                "«Действительный сертификат» → вкладка «Подробности» (Details), в «Иерархии сертификатов» "
+                "выберите средний сертификат (не верхний и не нижний) → «Экспорт» и сохраните его в папку "
+                f"issuer_certs рядом со скриптом под именем {name}.cer. Скрипт будет брать его оттуда.")
     if "ошибка сертификата" in error and is_ru_zone(host):
         return ("Если --setup-cert ещё не выполнялся, выполните python tender_monitor.py --setup-cert. Если "
                 "ошибка останется, пришлите этот отчёт; при предупреждении о сертификате в браузере источник "
