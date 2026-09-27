@@ -625,6 +625,13 @@ class MissingIntermediate(unittest.TestCase):
         self.enterContext(patched(tm, "ISSUERS_DIR", Path(self.dir.name) / "issuer_certs"))
         self.enterContext(patched(tm.Http, "_peer_certificate", lambda http, url: (self.site, "")))
 
+    @staticmethod
+    def loaded(http, url: str) -> list[bytes]:
+        """Сертификаты, с которыми будет проверяться сайт."""
+        http.verify_for(url)
+        adapter = http.session.get_adapter(url)
+        return adapter.context.get_ca_certs(binary_form=True) if isinstance(adapter, tm.HostTLSAdapter) else []
+
     def http(self, served: dict[str, bytes]):
         import requests
         http = tm.Http(CFG)
@@ -658,10 +665,10 @@ class MissingIntermediate(unittest.TestCase):
         self.assertEqual(saved.count("BEGIN CERTIFICATE"), 1)
         self.assertEqual(tm.ssl.PEM_cert_to_DER_cert(saved), self.intermediate)
         # сертификат применяется только к своему сайту
-        bundle = http.verify_for("https://aston.ru/tenders/")
-        self.assertIsInstance(bundle, str)
-        self.assertIn(saved.strip(), Path(bundle).read_text(encoding="ascii"))
-        self.assertNotIn(bundle, (http.verify_for("https://www.oteko.ru/x"), http.verify_for("https://example.com/")))
+        self.assertIn(self.intermediate, self.loaded(http, "https://aston.ru/tenders/"))
+        for other in ("https://www.oteko.ru/x", "https://example.com/"):
+            http.verify_for(other)
+            self.assertNotIsInstance(http.session.get_adapter(other), tm.HostTLSAdapter)
         # второй раз за проверку сайт не опрашивается
         self.assertFalse(http.fetch_missing_issuer("https://aston.ru/other"))
 
@@ -718,7 +725,7 @@ class MissingIntermediate(unittest.TestCase):
         http.verify_for("https://aston.ru/tenders/")
         adapter = http.session.get_adapter("https://aston.ru/tenders/")
         self.assertIsInstance(adapter, tm.HostTLSAdapter)
-        self.assertFalse(adapter._context.verify_flags & getattr(tm.ssl, "VERIFY_X509_PARTIAL_CHAIN", 0x80000))
+        self.assertFalse(adapter.context.verify_flags & getattr(tm.ssl, "VERIFY_X509_PARTIAL_CHAIN", 0x80000))
         self.assertNotIsInstance(http.session.get_adapter("https://aston.ru.example.com/"), tm.HostTLSAdapter)
         self.assertIn("сайт показал сертификат «localhost», выданный «Test Intermediate CA»",
                       http.issuer_notes["aston.ru"])
@@ -774,21 +781,28 @@ class MissingIntermediate(unittest.TestCase):
         tm.ISSUERS_DIR.mkdir()
         (tm.ISSUERS_DIR / "www.oteko.ru.cer").write_bytes(self.intermediate)  # экспорт из браузера в DER
         http = self.http({})
-        bundle = http.verify_for("https://www.oteko.ru/suppliers/")
-        self.assertIsInstance(bundle, str)
-        self.assertIn(tm.ssl.DER_cert_to_PEM_cert(self.intermediate).strip(), Path(bundle).read_text(encoding="ascii"))
+        self.assertIn(self.intermediate, self.loaded(http, "https://www.oteko.ru/suppliers/"))
+
+    def test_broken_saved_file_is_reported(self):
+        tm.ISSUERS_DIR.mkdir()
+        (tm.ISSUERS_DIR / "www.oteko.ru.cer").write_bytes(b"not a certificate")
+        http = self.http({})
+        self.assertIs(http.verify_for("https://www.oteko.ru/"), True)
+        self.assertNotIsInstance(http.session.get_adapter("https://www.oteko.ru/"), tm.HostTLSAdapter)
+        self.assertIn("сертификаты не загрузились", http.direct_check("https://www.oteko.ru/"))
 
     def test_get_retries_with_downloaded_intermediate(self):
         import requests
         http = self.http({"http://pki.test/int.crt": self.intermediate})
         fetch_get = http.session.get
-        verified_with = []
+        attempts = []
 
         def get(url, **kwargs):
             if "pki.test" in url:
                 return fetch_get(url, **kwargs)
-            verified_with.append(kwargs.get("verify"))
-            if kwargs.get("verify") is True:
+            adapter = http.session.get_adapter(url)
+            attempts.append(isinstance(adapter, tm.HostTLSAdapter))
+            if not attempts[-1]:
                 raise requests.exceptions.SSLError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
                                                    "unable to get local issuer certificate (_ssl.c:1081)")
             return FakeResponse(url, b"<html></html>", "text/html; charset=utf-8")
@@ -796,8 +810,8 @@ class MissingIntermediate(unittest.TestCase):
         http.session.get = get
         with patched(tm.time, "sleep", lambda s: None):
             http.get("https://aston.example/tenders/")
-        self.assertEqual(verified_with[0], True)
-        self.assertTrue(str(verified_with[1]).endswith("aston.example.bundle.pem"))
+        self.assertEqual(attempts, [False, True])  # повтор — уже с докачанным сертификатом
+        self.assertIn(self.intermediate, self.loaded(http, "https://aston.example/tenders/"))
 
 
 if __name__ == "__main__":

@@ -64,7 +64,7 @@ except ModuleNotFoundError:
     print("Не хватает библиотек. Установите их командой:\n    pip install requests beautifulsoup4")
     sys.exit(1)
 
-VERSION = "1.5"
+VERSION = "1.6"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.toml"
 DB_PATH = BASE_DIR / "tender_monitor.db"
@@ -1102,17 +1102,16 @@ class HostTLSAdapter(requests.adapters.HTTPAdapter):
     из файла, даже промежуточный; скачанному по http промежуточному так доверять нельзя —
     цепочка должна доходить до корневого."""
 
-    def __init__(self):
-        self._context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)  # сертификаты загрузит urllib3 из verify
-        self._context.verify_flags &= ~getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
+    def __init__(self, context: ssl.SSLContext):
+        self.context = context
         super().__init__()
 
     def init_poolmanager(self, *args, **kwargs):
-        kwargs["ssl_context"] = self._context
+        kwargs["ssl_context"] = self.context
         return super().init_poolmanager(*args, **kwargs)
 
     def proxy_manager_for(self, proxy, **kwargs):
-        kwargs["ssl_context"] = self._context
+        kwargs["ssl_context"] = self.context
         return super().proxy_manager_for(proxy, **kwargs)
 
 
@@ -1200,7 +1199,8 @@ class Http:
         self.robots: dict[str, Robots | None] = {}
         self.last_hit: dict[str, float] = {}
         self.down: dict[str, str] = {}  # сайты, которые не ответили в эту проверку
-        self.host_bundles: dict[str, str] = {}
+        self.host_contexts: dict[str, ssl.SSLContext] = {}
+        self.context_errors: dict[str, str] = {}
         self.issuer_tried: set[str] = set()
         self.issuer_notes: dict[str, str] = {}
         self.sent_chains: dict[str, list[bytes]] = {}  # что прислал сайт (Python 3.13+), для диагностики
@@ -1210,36 +1210,38 @@ class Http:
             return self.bundle
         return requests.certs.where()
 
-    def _host_bundle(self, host: str) -> str | None:
-        """Файл доверенных сертификатов для сайта, которому докачан промежуточный сертификат."""
-        if host in self.host_bundles:
-            return self.host_bundles[host]
+    def _host_context(self, host: str) -> ssl.SSLContext | None:
+        """Настройки проверки для сайта, которому докачаны или вручную сохранены сертификаты.
+        Всё загружается прямо в память: промежуточный файл на некоторых компьютерах не собирался."""
+        if host in self.host_contexts:
+            return self.host_contexts[host]
         # <сайт>.crt — докачанные скриптом, <сайт>.cer — сохранённые вручную из браузера (DER или Base64)
         extras = [f for f in (_host_file(host, ".crt"), _host_file(host, ".cer")) if f.is_file()]
         if not extras:
             return None
-        path = _host_file(host, ".bundle.pem")
         try:
-            base = Path(self._base_bundle(host)).read_text(encoding="ascii", errors="ignore")
-            parts = [base.strip()] + [_pem_from_file(f).strip() for f in extras]
-            path.write_text("\n".join(parts) + "\n", encoding="ascii")
-            ssl.create_default_context(cafile=str(path))
-        except (OSError, ssl.SSLError) as exc:
-            log.warning("%s: не удалось собрать файл сертификатов (%s)", host, short_err(exc))
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.verify_flags &= ~getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
+            context.load_verify_locations(cafile=self._base_bundle(host))
+            for f in extras:
+                context.load_verify_locations(cadata=_pem_from_file(f))
+        except (OSError, ValueError, ssl.SSLError) as exc:
+            self.context_errors[host] = f"{exc.__class__.__name__}: {short_err(exc)}"
+            log.warning("%s: не удалось загрузить сертификаты (%s)", host, self.context_errors[host])
             return None
-        self.host_bundles[host] = str(path)
-        return str(path)
+        self.host_contexts[host] = context
+        return context
 
     def verify_for(self, url: str):
         parts = urlparse(url)
         host = parts.hostname or ""
-        own = self._host_bundle(host)
-        if own:
-            if parts.scheme == "https":
-                prefix = f"https://{parts.netloc.rpartition('@')[2].lower()}/"
-                if prefix not in self.session.adapters:
-                    self.session.mount(prefix, HostTLSAdapter())
-            return own
+        context = self._host_context(host)
+        if context is not None:
+            prefix = f"https://{parts.netloc.rpartition('@')[2].lower()}/"
+            adapter = self.session.adapters.get(prefix)
+            if not isinstance(adapter, HostTLSAdapter) or adapter.context is not context:
+                self.session.mount(prefix, HostTLSAdapter(context))
+            return True  # проверку делает контекст адаптера
         return self.bundle if (self.bundle and is_ru_zone(host)) else True
 
     def fetch_missing_issuer(self, url: str) -> bool:
@@ -1346,7 +1348,7 @@ class Http:
             return fail(details if (notes or root_note) else f"недостающих сертификатов не нашлось; {details}")
         ISSUERS_DIR.mkdir(exist_ok=True)
         extra.write_text("".join(pems), encoding="ascii")  # цепочка целиком заменяет найденную раньше
-        self.host_bundles.pop(host, None)
+        self.host_contexts.pop(host, None)
         names = ", ".join(f"«{cert_cn(c)}»" for c in chain)
         log.info("%s: добавлены сертификаты %s", host, names)
         # если и с ними не откроется, в ошибке будет видно, что докачка была
@@ -1358,13 +1360,12 @@ class Http:
         сертификатов. Если она проходит, а запрос нет, дело не в сертификатах."""
         parts = urlparse(url)
         host = parts.hostname or ""
-        cafile = self._host_bundle(host)
-        if not cafile or self._proxy_for(url):
+        context = self._host_context(host)
+        if context is None:
+            return "сертификаты не загрузились: " + self.context_errors.get(host, "файла с ними нет")
+        if self._proxy_for(url):
             return ""
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        context.verify_flags &= ~getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
         try:
-            context.load_verify_locations(cafile=cafile)
             with socket.create_connection((host, parts.port or 443), timeout=15) as sock:
                 with context.wrap_socket(sock, server_hostname=host):
                     return "прямая проверка через ssl проходит"
